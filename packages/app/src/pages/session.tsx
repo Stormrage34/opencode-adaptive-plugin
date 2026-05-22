@@ -32,6 +32,7 @@ import { showToast } from "@opencode-ai/ui/toast"
 import { checksum } from "@opencode-ai/core/util/encode"
 import { useLocation, useSearchParams } from "@solidjs/router"
 import { NewSessionView, SessionHeader } from "@/components/session"
+import { NewSessionDesignView } from "@/components/session/session-new-design-view"
 import { useComments } from "@/context/comments"
 import { getSessionPrefetch, SESSION_PREFETCH_TTL } from "@/context/global-sync/session-prefetch"
 import { useGlobalSync } from "@/context/global-sync"
@@ -1661,7 +1662,6 @@ export default function Page() {
         inputRef = el
       }}
       newSessionWorktree={newSessionWorktree()}
-      onNewSessionWorktreeChange={(value) => setStore("newSessionWorktree", value)}
       onNewSessionWorktreeReset={() => setStore("newSessionWorktree", "main")}
       onSubmit={() => {
         comments.clear()
@@ -1797,7 +1797,11 @@ export default function Page() {
                 </Show>
               </Match>
               <Match when={true}>
-                <NewSessionView worktree={newSessionWorktree()} />
+                <Show when={USE_NEW_SESSION_DESIGN} fallback={<NewSessionView worktree={newSessionWorktree()} />}>
+                  <NewSessionDesignView>
+                    {composerRegion("inline")}
+                  </NewSessionDesignView>
+                </Show>
               </Match>
             </Switch>
           </div>

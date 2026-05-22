@@ -29,6 +29,7 @@ export type Event =
   | EventSessionIdle
   | EventMcpToolsChanged
   | EventMcpBrowserOpenFailed
+  | EventMcpStatusChanged
   | EventCommandExecuted
   | EventProjectUpdated
   | EventSessionCompacted
@@ -351,6 +352,40 @@ export type SessionStatus =
   | {
       type: "busy"
     }
+
+export type McpStatusConnected = {
+  status: "connected"
+}
+
+export type McpStatusDisabled = {
+  status: "disabled"
+}
+
+export type McpStatusConnecting = {
+  status: "connecting"
+}
+
+export type McpStatusFailed = {
+  status: "failed"
+  error: string
+}
+
+export type McpStatusNeedsAuth = {
+  status: "needs_auth"
+}
+
+export type McpStatusNeedsClientRegistration = {
+  status: "needs_client_registration"
+  error: string
+}
+
+export type McpStatus =
+  | McpStatusConnected
+  | McpStatusDisabled
+  | McpStatusConnecting
+  | McpStatusFailed
+  | McpStatusNeedsAuth
+  | McpStatusNeedsClientRegistration
 
 export type Project = {
   id: string
@@ -830,6 +865,7 @@ export type GlobalEvent = {
     | EventSessionIdle
     | EventMcpToolsChanged
     | EventMcpBrowserOpenFailed
+    | EventMcpStatusChanged
     | EventCommandExecuted
     | EventProjectUpdated
     | EventSessionCompacted
@@ -1448,6 +1484,7 @@ export type WorktreeError = {
 
 export type WorktreeCreateInput = {
   name?: string
+  branch?: string
   /**
    * Additional startup script to run after the project's start command
    */
@@ -1660,35 +1697,6 @@ export type FormatterStatus = {
   extensions: Array<string>
   enabled: boolean
 }
-
-export type McpStatusConnected = {
-  status: "connected"
-}
-
-export type McpStatusDisabled = {
-  status: "disabled"
-}
-
-export type McpStatusFailed = {
-  status: "failed"
-  error: string
-}
-
-export type McpStatusNeedsAuth = {
-  status: "needs_auth"
-}
-
-export type McpStatusNeedsClientRegistration = {
-  status: "needs_client_registration"
-  error: string
-}
-
-export type McpStatus =
-  | McpStatusConnected
-  | McpStatusDisabled
-  | McpStatusFailed
-  | McpStatusNeedsAuth
-  | McpStatusNeedsClientRegistration
 
 export type McpUnsupportedOAuthError = {
   error: string
@@ -2668,6 +2676,15 @@ export type EventMcpBrowserOpenFailed = {
   properties: {
     mcpName: string
     url: string
+  }
+}
+
+export type EventMcpStatusChanged = {
+  id: string
+  type: "mcp.status.changed"
+  properties: {
+    name: string
+    status: McpStatus
   }
 }
 
@@ -4432,6 +4449,34 @@ export type WorktreeCreateResponses = {
 }
 
 export type WorktreeCreateResponse = WorktreeCreateResponses[keyof WorktreeCreateResponses]
+
+export type WorktreeBranchesData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/experimental/worktree/branch"
+}
+
+export type WorktreeBranchesErrors = {
+  /**
+   * WorktreeError | InvalidRequestError
+   */
+  400: WorktreeError | InvalidRequestError
+}
+
+export type WorktreeBranchesError = WorktreeBranchesErrors[keyof WorktreeBranchesErrors]
+
+export type WorktreeBranchesResponses = {
+  /**
+   * List of git branch names
+   */
+  200: Array<string>
+}
+
+export type WorktreeBranchesResponse = WorktreeBranchesResponses[keyof WorktreeBranchesResponses]
 
 export type WorktreeResetData = {
   body?: WorktreeResetInput
