@@ -51,7 +51,6 @@ type HomeSessionGroup = {
 }
 
 export default function Home() {
-  if (USE_HOME_DESIGN) return <HomeDesign />
   return <LegacyHome />
 }
 

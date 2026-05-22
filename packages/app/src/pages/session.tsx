@@ -31,7 +31,7 @@ import { Button } from "@opencode-ai/ui/button"
 import { showToast } from "@opencode-ai/ui/toast"
 import { checksum } from "@opencode-ai/core/util/encode"
 import { useLocation, useSearchParams } from "@solidjs/router"
-import { NewSessionDesignView, NewSessionView, SessionHeader } from "@/components/session"
+import { NewSessionView, SessionHeader } from "@/components/session"
 import { useComments } from "@/context/comments"
 import { getSessionPrefetch, SESSION_PREFETCH_TTL } from "@/context/global-sync/session-prefetch"
 import { useGlobalSync } from "@/context/global-sync"
@@ -1797,16 +1797,12 @@ export default function Page() {
                 </Show>
               </Match>
               <Match when={true}>
-                <Show when={USE_NEW_SESSION_DESIGN} fallback={<NewSessionView worktree={newSessionWorktree()} />}>
-                  <NewSessionDesignView worktree={newSessionWorktree()}>
-                    {composerRegion("inline")}
-                  </NewSessionDesignView>
-                </Show>
+                <NewSessionView worktree={newSessionWorktree()} />
               </Match>
             </Switch>
           </div>
 
-          <Show when={params.id || !USE_NEW_SESSION_DESIGN}>{composerRegion("dock")}</Show>
+          {composerRegion("dock")}
 
           <Show when={desktopReviewOpen()}>
             <div onPointerDown={() => size.start()}>
