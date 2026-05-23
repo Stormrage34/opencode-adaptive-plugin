@@ -6,7 +6,6 @@ import { onMount } from "solid-js"
 import { ProjectProvider, useProject } from "../../../src/cli/cmd/tui/context/project"
 import { SDKProvider } from "../../../src/cli/cmd/tui/context/sdk"
 import { useEvent } from "../../../src/cli/cmd/tui/context/event"
-import { createEventSource, createFetch, directory } from "../../fixture/tui-sdk"
 
 const projectID = "proj_test"
 
@@ -47,11 +46,35 @@ function update(version: string): Event {
   }
 }
 
+function createSource() {
+  let fn: ((event: GlobalEvent) => void) | undefined
+
+  return {
+    source: {
+      subscribe: async (handler: (event: GlobalEvent) => void) => {
+        fn = handler
+        return () => {
+          if (fn === handler) fn = undefined
+        }
+      },
+    },
+    emit(evt: GlobalEvent) {
+      if (!fn) throw new Error("event source not ready")
+      fn(evt)
+    },
+  }
+}
+
 async function mount() {
-  const events = createEventSource()
-  const calls = createFetch()
+  const source = createSource()
   const seen: Event[] = []
   const workspaces: Array<string | undefined> = []
+  const fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    if (url.pathname === "/path") return Response.json({ home: "", state: "", config: "", directory: "/tmp/root" })
+    if (url.pathname === "/project/current") return Response.json({ id: projectID })
+    throw new Error(`unexpected request: ${url.pathname}`)
+  }) as typeof globalThis.fetch
   let project!: ReturnType<typeof useProject>
   let done!: () => void
   const ready = new Promise<void>((resolve) => {
@@ -59,7 +82,7 @@ async function mount() {
   })
 
   const app = await testRender(() => (
-    <SDKProvider url="http://test" directory={directory} events={events.source} fetch={calls.fetch}>
+    <SDKProvider url="http://test" directory="/tmp/root" events={source.source} fetch={fetch}>
       <ProjectProvider>
         <Probe
           onReady={async (ctx) => {
@@ -75,7 +98,7 @@ async function mount() {
   ))
 
   await ready
-  return { app, emit: events.emit, project, seen, workspaces }
+  return { app, emit: source.emit, project, seen, workspaces }
 }
 
 function Probe(props: {
@@ -117,7 +140,7 @@ describe("useEvent", () => {
     const { app, emit, seen } = await mount()
 
     try {
-      emit(event(vcs("other"), { directory, project: "proj_other" }))
+      emit(event(vcs("other"), { directory: "/tmp/root", project: "proj_other" }))
       await Bun.sleep(30)
 
       expect(seen).toHaveLength(0)
