@@ -141,7 +141,7 @@ export const layer = Layer.effect(
               collectStream(handle.stderr, options?.maxErrorBytes),
               handle.exitCode,
             ],
-            { concurrency: "unbounded" },
+            { concurrency: 8 },
           )
           return {
             command: description,

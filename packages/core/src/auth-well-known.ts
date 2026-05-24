@@ -226,7 +226,7 @@ export const layer = Layer.effect(
               return configs
             }),
           ),
-          { concurrency: "unbounded" },
+          { concurrency: 5 },
         )
         return documents.flat()
       }),

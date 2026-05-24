@@ -159,7 +159,7 @@ export const layer = Layer.effect(
           if (id !== ID.make("*") && item.id !== id) continue
           const match = item.hooks[name]
           if (!match) continue
-          yield* match(event as any).pipe(
+          yield* (match as (event: Record<string, unknown>) => Effect.Effect<void>)(event).pipe(
             Effect.withSpan(`Plugin.hook.${name}`, {
               attributes: {
                 plugin: item.id,
@@ -173,6 +173,7 @@ export const layer = Layer.effect(
           event[field] = finishDraft(draft)
         }
 
+        // Name generic is not in scope inside Effect.fn callback; must keep cast broad
         return event as any
       }),
       remove: Effect.fn("Plugin.remove")(function* (id) {

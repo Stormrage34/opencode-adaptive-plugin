@@ -158,17 +158,17 @@ export const layer = Layer.effect(
         const pkg = yield* afs.readJson(path.join(dir, "package.json")).pipe(Effect.orElseSucceed(() => ({})))
         const lock = yield* afs.readJson(path.join(dir, "package-lock.json")).pipe(Effect.orElseSucceed(() => ({})))
 
-        const pkgAny = pkg as any
-        const lockAny = lock as any
+        const pkgRec = pkg as Record<string, any>
+        const lockRec = lock as Record<string, any>
         const declared = new Set([
-          ...Object.keys(pkgAny?.dependencies || {}),
-          ...Object.keys(pkgAny?.devDependencies || {}),
-          ...Object.keys(pkgAny?.peerDependencies || {}),
-          ...Object.keys(pkgAny?.optionalDependencies || {}),
+          ...Object.keys(pkgRec?.dependencies || {}),
+          ...Object.keys(pkgRec?.devDependencies || {}),
+          ...Object.keys(pkgRec?.peerDependencies || {}),
+          ...Object.keys(pkgRec?.optionalDependencies || {}),
           ...(input?.add || []).map((pkg) => pkg.name),
         ])
 
-        const root = lockAny?.packages?.[""] || {}
+        const root = lockRec?.packages?.[""] || {}
         const locked = new Set([
           ...Object.keys(root?.dependencies || {}),
           ...Object.keys(root?.devDependencies || {}),
