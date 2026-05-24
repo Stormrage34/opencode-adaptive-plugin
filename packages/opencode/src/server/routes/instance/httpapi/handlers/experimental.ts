@@ -37,7 +37,7 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
           account.orgsByAccount().pipe(Effect.catch(() => Effect.fail(new HttpApiError.InternalServerError({})))),
         ],
         {
-          concurrency: "unbounded",
+          concurrency: 8,
         },
       )
       return {
@@ -54,7 +54,7 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
           account.active().pipe(Effect.catch(() => Effect.fail(new HttpApiError.InternalServerError({})))),
         ],
         {
-          concurrency: "unbounded",
+          concurrency: 8,
         },
       )
       const info = Option.getOrUndefined(active)
