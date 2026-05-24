@@ -884,7 +884,7 @@ const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function*
       return job.metadata?.parentSessionId === sessionID
     }),
     (job) => background.cancel(job.id),
-    { concurrency: "unbounded", discard: true },
+    { concurrency: 5, discard: true },
   )
 })
 

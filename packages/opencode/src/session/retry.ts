@@ -165,6 +165,8 @@ function parseJSON(value: unknown) {
   return iife(() => {
     try {
       if (typeof value !== "string") return undefined
+      // value is a known JSON string (e.g. from an HTTP response body),
+      // so JSON.parse is needed here to deserialize it.
       return JSON.parse(value)
     } catch {
       return undefined

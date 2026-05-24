@@ -197,6 +197,8 @@ export const layer: Layer.Layer<
           continue
         }
 
+        // Get or create a Set tracking which instruction files have already been
+        // attached for this message, so we don't attach duplicates.
         let set = s.claims.get(messageID)
         if (!set) {
           set = new Set()

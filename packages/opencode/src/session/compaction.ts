@@ -239,7 +239,11 @@ export const layer = Layer.effect(
       model: Provider.Model
     }) {
       const msgs = yield* MessageV2.toModelMessagesEffect(input.messages, input.model)
-      return Token.estimate(JSON.stringify(msgs))
+      let total = 0
+      for (const msg of msgs) {
+        total += JSON.stringify(msg).length
+      }
+      return Math.max(0, Math.round(total / 4))
     })
 
     const select = Effect.fn("SessionCompaction.select")(function* (input: {

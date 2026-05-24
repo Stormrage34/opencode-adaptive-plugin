@@ -228,7 +228,7 @@ export const layer = Layer.effect(
             mime: stat.type === "Directory" ? "application/x-directory" : "text/plain",
           })
         }),
-        { concurrency: "unbounded", discard: true },
+        { concurrency: 10, discard: true },
       )
       return parts
     })
@@ -1061,7 +1061,7 @@ export const layer = Layer.effect(
         return [{ ...part, messageID: info.id, sessionID: input.sessionID }]
       })
 
-      const resolvedParts = yield* Effect.forEach(input.parts, resolvePart, { concurrency: "unbounded" }).pipe(
+      const resolvedParts = yield* Effect.forEach(input.parts, resolvePart, { concurrency: 8 }).pipe(
         Effect.map((x) => x.flat().map(assign)),
       )
 

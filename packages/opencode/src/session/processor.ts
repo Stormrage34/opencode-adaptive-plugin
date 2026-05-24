@@ -30,6 +30,29 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
+
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (a == null || b == null) return false
+  if (typeof a !== typeof b) return false
+  if (typeof a !== "object") return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  if (Array.isArray(a)) {
+    if (a.length !== (b as unknown[]).length) return false
+    for (let i = 0; i < a.length; i++) {
+      if (!deepEqual(a[i], (b as unknown[])[i])) return false
+    }
+    return true
+  }
+  const aKeys = Object.keys(a as Record<string, unknown>)
+  const bKeys = Object.keys(b as Record<string, unknown>)
+  if (aKeys.length !== bKeys.length) return false
+  for (const key of aKeys) {
+    if (!Object.prototype.hasOwnProperty.call(b, key)) return false
+    if (!deepEqual((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key])) return false
+  }
+  return true
+}
 const log = Log.create({ service: "session.processor" })
 
 export type Result = "compact" | "stop" | "continue"
@@ -431,7 +454,7 @@ export const layer = Layer.effect(
                   part.type === "tool" &&
                   part.tool === value.name &&
                   part.state.status !== "pending" &&
-                  JSON.stringify(part.state.input) === JSON.stringify(input),
+                  deepEqual(part.state.input, input),
               )
             ) {
               return
@@ -554,7 +577,8 @@ export const layer = Layer.effect(
 
           case "step-finish": {
             const completedSnapshot = yield* snapshot.track()
-            yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
+            const reasonings = Object.keys(ctx.reasoningMap)
+            yield* Effect.forEach(reasonings, finishReasoning)
             const usage = Session.getUsage({
               model: ctx.model,
               usage: value.usage ?? new Usage({}),
@@ -711,25 +735,31 @@ export const layer = Layer.effect(
           ctx.currentText = undefined
         }
 
-        for (const part of Object.values(ctx.reasoningMap)) {
+        const reasonings = ctx.reasoningMap
+        ctx.reasoningMap = {}
+        for (const part of Object.values(reasonings)) {
           const end = Date.now()
           yield* session.updatePart({
             ...part,
             time: { start: part.time.start ?? end, end },
           })
         }
-        ctx.reasoningMap = {}
 
+        const toolcalls = ctx.toolcalls
+        ctx.toolcalls = {}
         yield* Effect.forEach(
-          Object.values(ctx.toolcalls),
+          Object.values(toolcalls),
           (call) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
-          { concurrency: "unbounded" },
+          { concurrency: 5 },
         )
 
-        for (const toolCallID of Object.keys(ctx.toolcalls)) {
-          const match = yield* readToolCall(toolCallID)
-          if (!match) continue
-          const part = match.part
+        for (const call of Object.values(toolcalls)) {
+          const part = yield* session.getPart({
+            partID: call.partID,
+            messageID: call.messageID,
+            sessionID: call.sessionID,
+          })
+          if (!part || part.type !== "tool") continue
           const end = Date.now()
           const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
           yield* session.updatePart({
@@ -743,7 +773,6 @@ export const layer = Layer.effect(
             },
           })
         }
-        ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()
         yield* session.updateMessage(ctx.assistantMessage)
       })

@@ -1,7 +1,7 @@
 import { InstanceState } from "@/effect/instance-state"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
-import { Effect, Latch, Layer, Scope, Context } from "effect"
+import { Effect, Latch, Layer, Scope, Context, SynchronizedRef } from "effect"
 import * as Session from "./session"
 import { MessageV2 } from "./message-v2"
 import { SessionID } from "./schema"
@@ -34,14 +34,14 @@ export const layer = Layer.effect(
     const state = yield* InstanceState.make(
       Effect.fn("SessionRunState.state")(function* () {
         const scope = yield* Scope.Scope
-        const runners = new Map<SessionID, Runner.Runner<MessageV2.WithParts>>()
+        const runners = yield* SynchronizedRef.make(new Map<SessionID, Runner.Runner<MessageV2.WithParts>>())
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
-            yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
-              concurrency: "unbounded",
+            const map = yield* SynchronizedRef.get(runners)
+            yield* Effect.forEach(map.values(), (runner) => runner.cancel, {
+              concurrency: 5,
               discard: true,
             })
-            runners.clear()
           }),
         )
         return { runners, scope }
@@ -53,30 +53,36 @@ export const layer = Layer.effect(
       onInterrupt: Effect.Effect<MessageV2.WithParts>,
     ) {
       const data = yield* InstanceState.get(state)
-      const existing = data.runners.get(sessionID)
+      const existing = yield* SynchronizedRef.get(data.runners).pipe(Effect.map((m) => m.get(sessionID)))
       if (existing) return existing
       const next = Runner.make<MessageV2.WithParts>(data.scope, {
         onIdle: Effect.gen(function* () {
-          data.runners.delete(sessionID)
+          yield* SynchronizedRef.update(data.runners, (m) => {
+            m.delete(sessionID)
+            return m
+          })
           yield* status.set(sessionID, { type: "idle" })
         }),
         onBusy: status.set(sessionID, { type: "busy" }),
         onInterrupt,
       })
-      data.runners.set(sessionID, next)
+      yield* SynchronizedRef.update(data.runners, (m) => {
+        m.set(sessionID, next)
+        return m
+      })
       return next
     })
 
     const assertNotBusy = Effect.fn("SessionRunState.assertNotBusy")(function* (sessionID: SessionID) {
       const data = yield* InstanceState.get(state)
-      const existing = data.runners.get(sessionID)
+      const existing = yield* SynchronizedRef.get(data.runners).pipe(Effect.map((m) => m.get(sessionID)))
       if (existing?.busy) yield* busyError(sessionID)
     })
 
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
       yield* cancelBackgroundJobs(background, sessionID)
       const data = yield* InstanceState.get(state)
-      const existing = data.runners.get(sessionID)
+      const existing = yield* SynchronizedRef.get(data.runners).pipe(Effect.map((m) => m.get(sessionID)))
       if (!existing || !existing.busy) {
         yield* status.set(sessionID, { type: "idle" })
         return
@@ -140,7 +146,7 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
             }),
           ),
         ),
-      { concurrency: "unbounded", discard: true },
+      { concurrency: 5, discard: true },
     )
     batch = jobs.filter(matches)
   }
