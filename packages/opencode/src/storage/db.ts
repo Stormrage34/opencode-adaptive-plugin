@@ -103,8 +103,12 @@ export const Client = Object.assign(
 
     db.run("PRAGMA journal_mode = WAL")
     db.run("PRAGMA synchronous = NORMAL")
-    db.run("PRAGMA busy_timeout = 5000")
-    db.run("PRAGMA cache_size = -64000")
+    db.run("PRAGMA busy_timeout = 15000")
+    db.run("PRAGMA cache_size = -256000")
+    db.run("PRAGMA mmap_size = 268435456")
+    db.run("PRAGMA temp_store = MEMORY")
+    db.run("PRAGMA cache_spill = OFF")
+    db.run("PRAGMA wal_autocheckpoint = 1000")
     db.run("PRAGMA foreign_keys = ON")
     db.run("PRAGMA wal_checkpoint(PASSIVE)")
 
@@ -170,8 +174,12 @@ export function effect(fn: () => any | Promise<any>) {
   const bound = EffectBridge.bind(fn)
   try {
     ctx.use().effects.push(bound)
-  } catch {
-    bound()
+  } catch (err) {
+    if (err instanceof LocalContext.NotFound) {
+      bound()
+      return
+    }
+    throw err
   }
 }
 

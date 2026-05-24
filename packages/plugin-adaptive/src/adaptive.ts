@@ -1,11 +1,12 @@
 // opencode-plugin-adaptive
 // Self-improving plugin for OpenCode that adapts strategy based on acceptance rates
 // https://github.com/opencode-ai/opencode
-// Version: 1.0.0-rule-only
+// Version: 1.1.0-sqlite-telemetry
 
 import { Plugin, tool } from "@opencode-ai/plugin"
 import path from "path"
 import fs from "fs/promises"
+import { Database } from "bun:sqlite"
 
 // ============================================================================
 // Types
@@ -31,6 +32,7 @@ interface PluginState {
   acceptThreshold: number
   lastAdaptation?: number
   overrides: Record<TaskType, boolean>
+  modelPricing: Record<string, { input: number; output: number }>
 }
 
 const DEFAULT_STATE: PluginState = {
@@ -60,13 +62,21 @@ const DEFAULT_STATE: PluginState = {
     reasoning: false,
     debug: false,
   },
+  modelPricing: {
+    // Pricing per 1K tokens (USD)
+    "qwen3.5-plus": { input: 0.0002, output: 0.0006 },
+    "qwen3.5": { input: 0.0001, output: 0.0004 },
+    "o4-mini": { input: 0.001, output: 0.003 },
+    "claude-sonnet-4": { input: 0.0003, output: 0.0015 },
+    "gpt-4o": { input: 0.0005, output: 0.0015 },
+  },
 }
 
 // ============================================================================
 // Classifier (O(1) heuristic)
 // ============================================================================
 
-const DEBUG_KEYWORDS = ["error", "exception", "stack", "break", "fails", "failed", "bug", "fix", "crash"]
+const DEBUG_KEYWORDS = ["error", "exception", "stack", "break", "fails", "failed", "bug", "crash"]
 const CODING_KEYWORDS = [
   "syntax",
   "imports",
@@ -128,13 +138,88 @@ function classify(prompt: string): TaskType {
 // ============================================================================
 
 export const AdaptivePlugin: Plugin = async (ctx, options) => {
-  const config = options as { statePath?: string; debug?: boolean } | undefined
+  const config = options as { statePath?: string; debug?: boolean; telemetryDb?: string } | undefined
   const statePath = config?.statePath || path.join(ctx.directory, ".opencode_adaptive_state.json")
+  const telemetryDbPath = config?.telemetryDb || path.join(ctx.directory, ".opencode_telemetry.db")
   const debug = config?.debug || false
   let state = await loadState(statePath)
 
-  // Debounce timer for state writes
+  // Initialize SQLite telemetry database with WAL mode for concurrent writes
+  let telemetryDb: Database | null = null
+  try {
+    telemetryDb = new Database(telemetryDbPath)
+    telemetryDb.run("PRAGMA journal_mode=WAL;")
+    telemetryDb.run("PRAGMA busy_timeout=5000;")
+    telemetryDb.run(`
+      CREATE TABLE IF NOT EXISTS telemetry (
+        id INTEGER PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        model TEXT NOT NULL,
+        tokens_in INTEGER NOT NULL,
+        tokens_out INTEGER NOT NULL,
+        cost REAL NOT NULL,
+        exit_code INTEGER NOT NULL,
+        ts DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_telemetry_task_id ON telemetry(task_id);
+    `)
+    log("[telemetry] SQLite initialized with WAL mode")
+  } catch (error) {
+    log("[telemetry] Failed to initialize SQLite, falling back to in-memory only:", error)
+    telemetryDb = null
+  }
+
+  // Async queue for telemetry writes (batch flush: 50 ops or 100ms)
+  const telemetryQueue: Array<() => void> = []
   let flushTimer: NodeJS.Timeout | null = null
+  const TELEMETRY_BATCH_SIZE = 50
+  const TELEMETRY_FLUSH_INTERVAL = 100
+
+  const queueTelemetryWrite = (writeOp: () => void) => {
+    telemetryQueue.push(writeOp)
+    
+    if (telemetryQueue.length >= TELEMETRY_BATCH_SIZE) {
+      flushTelemetryQueue()
+    } else if (!flushTimer) {
+      flushTimer = setTimeout(flushTelemetryQueue, TELEMETRY_FLUSH_INTERVAL)
+    }
+  }
+
+  const flushTelemetryQueue = () => {
+    if (flushTimer) {
+      clearTimeout(flushTimer)
+      flushTimer = null
+    }
+
+    if (telemetryQueue.length === 0 || !telemetryDb) return
+
+    const batch = [...telemetryQueue]
+    telemetryQueue.length = 0
+
+    try {
+      telemetryDb.transaction(() => {
+        for (const writeOp of batch) {
+          writeOp()
+        }
+      })
+      log(`[telemetry] Flushed ${batch.length} ops to SQLite`)
+    } catch (error) {
+      log("[telemetry] Batch flush failed:", error)
+      // Re-queue failed ops at the front
+      telemetryQueue.unshift(...batch)
+    }
+  }
+
+  // Flush on process exit
+  process.on("beforeExit", () => {
+    flushTelemetryQueue()
+    if (telemetryDb) {
+      telemetryDb.close()
+    }
+  })
+
+  // Debounce timer for JSON state writes
+  let jsonStateTimer: NodeJS.Timeout | null = null
 
   const log = (...args: any[]) => {
     if (debug) console.log("[adaptive]", ...args)
@@ -142,18 +227,18 @@ export const AdaptivePlugin: Plugin = async (ctx, options) => {
 
   // Debounced save - coalesces writes within 10s window
   const scheduleSave = () => {
-    if (flushTimer) clearTimeout(flushTimer)
-    flushTimer = setTimeout(async () => {
+    if (jsonStateTimer) clearTimeout(jsonStateTimer)
+    jsonStateTimer = setTimeout(async () => {
       await saveState(statePath, state)
-      flushTimer = null
+      jsonStateTimer = null
     }, 10000)
   }
 
   // Immediate flush (for process exit)
   const flush = async () => {
-    if (flushTimer) {
-      clearTimeout(flushTimer)
-      flushTimer = null
+    if (jsonStateTimer) {
+      clearTimeout(jsonStateTimer)
+      jsonStateTimer = null
     }
     await saveState(statePath, state)
   }
@@ -232,13 +317,41 @@ export const AdaptivePlugin: Plugin = async (ctx, options) => {
       task_type: tool.schema.enum(["coding", "reasoning", "debug"]).describe("Task type (auto-detected if omitted)"),
       accepted: tool.schema.boolean().describe("Whether the suggestion was accepted"),
       latency_ms: tool.schema.number().describe("Latency in milliseconds"),
-      tokens_used: tool.schema.number().describe("Input + output token count"),
+      input_tokens: tool.schema.number().describe("Input/prompt token count"),
+      output_tokens: tool.schema.number().describe("Output/completion token count"),
+      model: tool.schema.string().describe("Model used (e.g., qwen3.5-plus, o4-mini)"),
       strategy_used: tool.schema.enum(["fast", "balanced", "verified"]).describe("Strategy that was used"),
+      task_id: tool.schema.string().optional().describe("Task identifier for tracking"),
       error: tool.schema.string().optional().describe("Error message if the operation failed"),
     },
     async execute(args) {
       const taskType = args.task_type || classify(args.strategy_used || "coding")
-      record(taskType, args.accepted, args.latency_ms, args.tokens_used, args.strategy_used || "fast", args.error)
+      const totalTokens = args.input_tokens + args.output_tokens
+      
+      // Calculate cost based on model pricing
+      const pricing = state.modelPricing[args.model] || state.modelPricing["qwen3.5-plus"]
+      const estimatedCost = (args.input_tokens / 1000) * pricing.input + (args.output_tokens / 1000) * pricing.output
+      
+      // Record to SQLite telemetry (async queue, fire-and-forget)
+      const taskId = args.task_id || `task_${Date.now()}`
+      const exitCode = args.accepted ? 0 : 1
+      
+      queueTelemetryWrite(() => {
+        telemetryDb!.run(
+          "INSERT INTO telemetry (task_id, model, tokens_in, tokens_out, cost, exit_code) VALUES (?, ?, ?, ?, ?, ?)",
+          taskId,
+          args.model,
+          args.input_tokens,
+          args.output_tokens,
+          estimatedCost,
+          exitCode,
+        )
+      })
+      
+      log(`[telemetry] Queued: ${taskId} ${args.model} ${totalTokens} tokens $${estimatedCost.toFixed(6)}`)
+      
+      // Legacy: also record to per-type metrics (for strategy adaptation)
+      record(taskType, args.accepted, args.latency_ms, totalTokens, args.strategy_used || "fast", args.error)
 
       const metrics = state.metrics[taskType]
       const acceptRate = metrics.accepts / Math.max(1, metrics.calls)
@@ -250,6 +363,9 @@ export const AdaptivePlugin: Plugin = async (ctx, options) => {
         taskType,
         acceptRate: acceptRate.toFixed(2),
         strategy: state.activeStrategy[taskType],
+        cost: estimatedCost.toFixed(6),
+        totalTokens,
+        telemetry: "sqlite",
       })
     },
   })
@@ -259,12 +375,83 @@ export const AdaptivePlugin: Plugin = async (ctx, options) => {
     description: "Get the current adaptive strategy and metrics per task type",
     args: {
       reset: tool.schema.boolean().optional().describe("Reset all metrics and state"),
+      tokens: tool.schema.boolean().optional().describe("Show token usage and cost statistics"),
     },
     async execute(args) {
       if (args.reset) {
         state = { ...DEFAULT_STATE }
         await flush()
         return "State reset to defaults"
+      }
+
+      // Show token stats if requested
+      if (args.tokens) {
+        if (!telemetryDb) {
+          return "Telemetry database not initialized"
+        }
+        
+        // Query aggregate stats from SQLite
+        const totals = telemetryDb
+          .query("SELECT SUM(tokens_in) as input, SUM(tokens_out) as output, SUM(cost) as total FROM telemetry")
+          .get() as { input: number | null; output: number | null; total: number | null }
+        
+        const totalTokens = (totals.input || 0) + (totals.output || 0)
+        const inputTokens = totals.input || 0
+        const outputTokens = totals.output || 0
+        const totalCost = totals.total || 0
+        
+        // Accept/reject cost analysis (exit_code: 0=accepted, 1=rejected)
+        const acceptedStats = telemetryDb
+          .query("SELECT SUM(cost) as cost FROM telemetry WHERE exit_code = 0")
+          .get() as { cost: number | null }
+        const rejectedStats = telemetryDb
+          .query("SELECT SUM(cost) as cost FROM telemetry WHERE exit_code = 1")
+          .get() as { cost: number | null }
+        
+        const acceptedCost = acceptedStats.cost || 0
+        const rejectedCost = rejectedStats.cost || 0
+        
+        // Model breakdown
+        const modelRows = telemetryDb
+          .query("SELECT model, COUNT(*) as calls, SUM(tokens_in + tokens_out) as tokens, SUM(cost) as cost FROM telemetry GROUP BY model ORDER BY cost DESC")
+          .all() as Array<{ model: string; calls: number; tokens: number; cost: number }>
+        
+        const modelStats: Record<string, { calls: number; tokens: number; cost: number }> = {}
+        for (const row of modelRows) {
+          modelStats[row.model] = {
+            calls: row.calls,
+            tokens: row.tokens,
+            cost: row.cost,
+          }
+        }
+        
+        // Recent logs (last 10)
+        const recentRows = telemetryDb
+          .query("SELECT task_id, model, tokens_in + tokens_out as tokens, cost, exit_code FROM telemetry ORDER BY id DESC LIMIT 10")
+          .all() as Array<{ task_id: string; model: string; tokens: number; cost: number; exit_code: number }>
+        
+        return JSON.stringify({
+          tokenUsage: {
+            total: totalTokens,
+            input: inputTokens,
+            output: outputTokens,
+            inputOutputRatio: totalTokens > 0 ? (inputTokens / totalTokens).toFixed(2) : "0.00",
+          },
+          cost: {
+            total: totalCost.toFixed(6),
+            accepted: acceptedCost.toFixed(6),
+            rejected: rejectedCost.toFixed(6),
+            wasteRate: totalCost > 0 ? (rejectedCost / totalCost).toFixed(2) : "0.00",
+          },
+          byModel: modelStats,
+          recentLogs: recentRows.map(row => ({
+            taskId: row.task_id,
+            model: row.model,
+            tokens: row.tokens,
+            cost: row.cost.toFixed(6),
+            accepted: row.exit_code === 0,
+          })),
+        }, null, 2)
       }
 
       const result: Record<TaskType, any> = {} as any
@@ -297,8 +484,7 @@ export const AdaptivePlugin: Plugin = async (ctx, options) => {
             lastAdaptation: state.lastAdaptation ? new Date(state.lastAdaptation).toISOString() : "never",
           },
         },
-        null,
-        2,
+        null, 2,
       )
     },
   })
@@ -347,13 +533,18 @@ export const AdaptivePlugin: Plugin = async (ctx, options) => {
     const ramInterval = setInterval(async () => {
       const mem = process.memoryUsage()
       log(`RAM: heap ${Math.round(mem.heapUsed / 1024 / 1024)}MB, rss ${Math.round(mem.rss / 1024 / 1024)}MB`)
-    }, 300000)
+    }, 300000).unref()
 
     // Cleanup on process exit
     process.on("exit", () => {
       clearInterval(ramInterval)
     })
   }
+
+  // Ensure state is flushed on process exit
+  process.on("beforeExit", () => {
+    flush()
+  })
 
   return {
     // Public API exposed for agent integration
@@ -369,6 +560,17 @@ export const AdaptivePlugin: Plugin = async (ctx, options) => {
     // Adjust LLM parameters based on current strategy (per-task-type)
     async "chat.params"(input, output) {
       const prompt = input.prompt || ""
+      
+      // Skip token limiting for subagents — they need full output budget for comprehensive work
+      // Subagents: librarian, explorer, oracle, designer, fixer, general, councillor
+      const isSubagent = input.agent && 
+        ['librarian', 'explorer', 'oracle', 'designer', 'fixer', 'general', 'councillor'].includes(input.agent)
+      
+      if (isSubagent) {
+        log(`[subagent:${input.agent}] skipping token limit, maxOutputTokens=${output.maxOutputTokens}`)
+        return
+      }
+      
       const taskType = classify(prompt)
       const strategy = state.activeStrategy[taskType]
       const maxTokens = state.contextBudgetTokens[strategy]
@@ -376,8 +578,7 @@ export const AdaptivePlugin: Plugin = async (ctx, options) => {
       const currentMax = typeof output.maxOutputTokens === "number" ? output.maxOutputTokens : 4096
       output.maxOutputTokens = Math.floor(Math.min(currentMax, maxTokens))
       log(`[${taskType}] ${strategy} strategy, maxOutputTokens=${output.maxOutputTokens}`)
-
-      return output
+      // Note: Don't return output - modify in place like other plugins
     },
 
     // Track context size for potential optimization
@@ -393,6 +594,7 @@ export const AdaptivePlugin: Plugin = async (ctx, options) => {
       if (contextSize > budget) {
         log(`[${taskType}] Context ${contextSize} chars exceeds budget ${budget} chars`)
       }
+      // Note: Don't return output - modify in place like other plugins
     },
   }
 }
@@ -458,6 +660,10 @@ async function loadState(filePath: string): Promise<PluginState> {
       overrides: {
         ...DEFAULT_STATE.overrides,
         ...parsed.overrides,
+      },
+      modelPricing: {
+        ...DEFAULT_STATE.modelPricing,
+        ...parsed.modelPricing,
       },
     }
 
