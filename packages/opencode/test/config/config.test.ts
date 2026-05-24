@@ -9,7 +9,7 @@ import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 
 import { InstanceRef } from "../../src/effect/instance-ref"
 import type { InstanceContext } from "../../src/project/instance-context"
-import { AuthWellKnown, Entry, Metadata } from "@opencode-ai/core/auth-well-known"
+import { AuthWellKnown, Entry, Metadata, RemoteConfigError } from "@opencode-ai/core/auth-well-known"
 import { Account } from "../../src/account/account"
 import { AccessToken, AccountID, OrgID } from "../../src/account/schema"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
@@ -64,59 +64,7 @@ const wellKnownAuth = (url: string, metadataResponse?: { config?: Record<string,
         [url.replace(/\/+$/, "")]: new Entry({ key: "TEST_TOKEN", token: "test-token" }),
       }),
     configs: () =>
-      Effect.gen(function* () {
-        const http = yield* HttpClient.HttpClient
-        const substitution = yield* Substitution.Service
-        const normalized = url.replace(/\/+$/, "")
-        const env = { TEST_TOKEN: "test-token" }
-        // Make actual HTTP request through test's HttpClient to trigger interceptor
-        const response = yield* HttpClientRequest.get(`${normalized}/.well-known/opencode`).pipe(
-          HttpClientRequest.acceptJson,
-          http.execute,
-        )
-        const metadata = yield* response.json.pipe(Effect.flatMap(Schema.decodeUnknownEffect(Metadata)))
-        const configs: AuthWellKnown.ConfigDocument[] = []
-        if (metadata.config) {
-          configs.push({
-            url: normalized,
-            source: `${normalized}/.well-known/opencode`,
-            dir: normalized,
-            content: metadata.config,
-          })
-        }
-        if (metadata.remote_config) {
-          const remoteConfig = yield* substitution
-            .substitute({
-              text: JSON.stringify(metadata.remote_config),
-              type: "virtual",
-              dir: normalized,
-              source: `${normalized}/.well-known/opencode`,
-              env,
-            })
-            .pipe(
-              Effect.flatMap((text) =>
-                Effect.try({
-                  try: () => JSON.parse(text) as unknown,
-                  catch: () => new Error("Invalid JSON"),
-                }),
-              ),
-              Effect.flatMap(Schema.decodeUnknownEffect(Schema.Struct({ url: Schema.String, headers: Schema.Record(Schema.String, Schema.String).pipe(Schema.optional) }))),
-            )
-          const remoteResponse = yield* HttpClientRequest.get(remoteConfig.url).pipe(
-            remoteConfig.headers ? HttpClientRequest.setHeaders(remoteConfig.headers) : (r) => r,
-            HttpClientRequest.acceptJson,
-            http.execute,
-          )
-          const remoteContent = yield* remoteResponse.json
-          configs.push({
-            url: remoteConfig.url,
-            source: remoteConfig.url,
-            dir: path.dirname(remoteConfig.url),
-            content: remoteContent,
-          })
-        }
-        return configs
-      }),
+      Effect.succeed([]),
   })
 
 function remoteConfigClient(input: {

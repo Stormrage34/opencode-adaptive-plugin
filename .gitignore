@@ -30,3 +30,9 @@ UPCOMING_CHANGELOG.md
 logs/
 *.bun-build
 tsconfig.tsbuildinfo
+
+# Adaptive plugin state
+.opencode_adaptive_state.json
+.opencode_telemetry.db
+**/.opencode_adaptive_state.json
+**/.opencode_telemetry.db
