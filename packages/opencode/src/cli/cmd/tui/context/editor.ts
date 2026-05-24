@@ -455,6 +455,7 @@ function openEditorSocket(connection: EditorConnection, WebSocketImpl: typeof We
     headers: {
       "x-claude-code-ide-authorization": connection.authToken,
     },
+  // WebSocket constructor doesn't type the non-standard headers option; shape is valid at runtime
   } as any)
 }
 

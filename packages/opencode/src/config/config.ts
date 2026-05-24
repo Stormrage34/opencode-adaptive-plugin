@@ -403,7 +403,7 @@ export const layer = Layer.effect(
               await fsNode.writeFile(path.join(Global.Path.config, "config.json"), JSON.stringify(result, null, 2))
               await fsNode.unlink(legacy)
             })
-            .catch(() => {}),
+            .catch((err) => log.error("failed to migrate legacy config", { error: err })),
         )
       }
 
@@ -708,7 +708,7 @@ export const layer = Layer.effect(
 
     const waitForDependencies = Effect.fn("Config.waitForDependencies")(function* () {
       yield* InstanceState.useEffect(state, (s) =>
-        Effect.forEach(s.deps, Fiber.join, { concurrency: "unbounded" }).pipe(Effect.asVoid),
+        Effect.forEach(s.deps, Fiber.join, { concurrency: 8 }).pipe(Effect.asVoid),
       )
     })
 

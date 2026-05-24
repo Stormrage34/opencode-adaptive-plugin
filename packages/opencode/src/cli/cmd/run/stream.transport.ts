@@ -655,7 +655,7 @@ function createLayer(input: StreamInput) {
               ),
             ],
             {
-              concurrency: "unbounded",
+              concurrency: 8,
             },
           )
 

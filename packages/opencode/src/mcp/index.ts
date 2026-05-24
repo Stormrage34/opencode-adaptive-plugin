@@ -625,7 +625,7 @@ export const layer = Layer.effect(
               }
               yield* applyCreateResult(s, key, result, mcp.timeout)
             }),
-          { concurrency: "unbounded", discard: true },
+          { concurrency: 5, discard: true },
         ),
       )
     })
@@ -678,7 +678,7 @@ export const layer = Layer.effect(
                   }
                   yield* Effect.tryPromise(() => client.close()).pipe(Effect.ignore)
                 }),
-              { concurrency: "unbounded" },
+              { concurrency: 5 },
             )
             pendingOAuthTransports.clear()
           }),
@@ -771,7 +771,7 @@ export const layer = Layer.effect(
               result[sanitize(clientName) + "_" + sanitize(mcpTool.name)] = convertMcpTool(mcpTool, client, timeout)
             }
           }),
-        { concurrency: "unbounded" },
+        { concurrency: 5 },
       )
       return result
     })
@@ -785,7 +785,7 @@ export const layer = Layer.effect(
         Object.entries(s.clients).filter(([name]) => s.status[name]?.status === "connected"),
         ([clientName, client]) =>
           fetchFromClient(clientName, client, listFn, label).pipe(Effect.map((items) => Object.entries(items ?? {}))),
-        { concurrency: "unbounded" },
+        { concurrency: 5 },
       ).pipe(Effect.map((results) => Object.fromEntries<T & { client: string }>(results.flat())))
     }
 

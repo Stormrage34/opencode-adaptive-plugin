@@ -669,7 +669,8 @@ export function Session() {
       title: conceal() ? "Disable code concealment" : "Enable code concealment",
       value: "session.toggle.conceal",
       search: "toggle code concealment",
-      keybind: "messages_toggle_conceal" as any,
+      // Valid keybind ID for the TUI binding system; not in the typed union
+      keybind: "messages_toggle_conceal" as unknown as string,
       category: "Session",
       run: () => {
         setConceal((prev) => !prev)
@@ -1442,6 +1443,7 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
               <Dynamic
                 last={index() === props.parts.length - 1}
                 component={component()}
+                // Dynamic component can't statically match part type to resolved component
                 part={part as any}
                 message={props.message}
               />

@@ -72,7 +72,7 @@ function listState() {
     const statuses = yield* mcp.status()
     const stored = yield* Effect.all(
       Object.fromEntries(configuredServers(config).map(([name]) => [name, mcp.hasStoredTokens(name)])),
-      { concurrency: "unbounded" },
+      { concurrency: 8 },
     )
     return { config, statuses, stored }
   })
@@ -85,7 +85,7 @@ function authState() {
     const config = yield* cfg.get()
     const auth = yield* Effect.all(
       Object.fromEntries(oauthServers(config).map(([name]) => [name, mcp.getAuthStatus(name)])),
-      { concurrency: "unbounded" },
+      { concurrency: 8 },
     )
     return { config, auth }
   })

@@ -242,7 +242,7 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | ChildPro
             Stream.mkString(Stream.decodeText(handle.stderr)),
             handle.exitCode,
           ],
-          { concurrency: "unbounded" },
+          { concurrency: 8 },
         )
         return { stdout, stderr, code }
       }, Effect.scoped)
@@ -399,7 +399,7 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | ChildPro
                 Stream.mkString(Stream.decodeText(handle.stderr)),
                 handle.exitCode,
               ],
-              { concurrency: "unbounded" },
+              { concurrency: 8 },
             )
 
             if (code !== 0 && code !== 1 && code !== 2) {

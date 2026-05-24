@@ -44,7 +44,10 @@ export async function run(db: SQLiteBunDatabase<any, any> | NodeSQLiteDatabase<a
 
   // const db = drizzle({ client: sqlite })
 
-  // Optimize SQLite for bulk inserts
+  // Optimize SQLite for bulk inserts.
+  // synchronous=OFF is safe here because all migration operations are wrapped in an explicit
+  // BEGIN/COMMIT transaction (see below). On crash the entire transaction is rolled back atomically,
+  // preventing partial writes and corruption. The speed gain is significant for bulk inserts.
   db.run("PRAGMA journal_mode = WAL")
   db.run("PRAGMA synchronous = OFF")
   db.run("PRAGMA cache_size = 10000")

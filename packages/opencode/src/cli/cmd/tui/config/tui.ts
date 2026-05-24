@@ -281,14 +281,14 @@ export const layer = Layer.effect(
           })
           .pipe(Effect.forkScoped),
       {
-        concurrency: "unbounded",
+        concurrency: 5,
       },
     )
 
     const get = Effect.fn("TuiConfig.get")(() => Effect.succeed(data.config))
 
     const waitForDependencies = Effect.fn("TuiConfig.waitForDependencies")(() =>
-      Effect.forEach(deps, Fiber.join, { concurrency: "unbounded" }).pipe(Effect.ignore(), Effect.asVoid),
+      Effect.forEach(deps, Fiber.join, { concurrency: 8 }).pipe(Effect.ignore(), Effect.asVoid),
     )
     return Service.of({ get, waitForDependencies })
   }).pipe(Effect.withSpan("TuiConfig.layer")),

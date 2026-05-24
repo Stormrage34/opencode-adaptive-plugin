@@ -189,7 +189,8 @@ export const layer = Layer.effect(
 
     const result = Service.of({
       create: Effect.fn("V2Session.create")(function* (_input) {
-        return {} as any
+        // Stub - actual implementation pending
+        return {} as Info
       }),
       get: Effect.fn("V2Session.get")(function* (sessionID) {
         const row = Database.use((db) => db.select().from(SessionTable).where(eq(SessionTable.id, sessionID)).get())

@@ -149,18 +149,22 @@ export async function create(input: {
   logger.info("starting client")
   const instance = input.instance
 
+  // ChildProcessWithoutNullStreams.stdout/stdin are Readable/Writable which are
+  // assignable to NodeJS.ReadableStream/NodeJS.WritableStream respectively, so
+  // no cast is needed.
   const connection = createMessageConnection(
-    new StreamMessageReader(input.server.process.stdout as any),
-    new StreamMessageWriter(input.server.process.stdin as any),
+    new StreamMessageReader(input.server.process.stdout),
+    new StreamMessageWriter(input.server.process.stdin),
   )
   // Server stderr can contain both real errors and routine informational logs,
   // which is normal stderr practice for some tools. Keep the raw stream at
   // debug so users can opt in with --print-logs --log-level DEBUG without
   // polluting normal logs.
-  input.server.process.stderr?.on("data", (data: Buffer) => {
+  const onStderrData = (data: Buffer) => {
     const text = data.toString().trim()
     if (text) logger.debug("server stderr", { text: text.slice(0, 1000) })
-  })
+  }
+  input.server.process.stderr?.on("data", onStderrData)
 
   // --- Connection state ---
 
@@ -692,6 +696,7 @@ export async function create(input: {
     },
     async shutdown() {
       logger.info("shutting down")
+      input.server.process.stderr?.off("data", onStderrData)
       connection.end()
       connection.dispose()
       await Process.stop(input.server.process)

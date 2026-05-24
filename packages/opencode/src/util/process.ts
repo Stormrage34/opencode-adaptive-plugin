@@ -98,7 +98,10 @@ export function spawn(cmd: string[], opts: Options = {}): Child {
       reject(error)
     })
   })
-  void exited.catch(() => undefined)
+  void exited.catch((error) => {
+    // Process exit promise should not reject silently — log the error so it's observable
+    console.error("process exit error:", error)
+  })
 
   if (opts.abort) {
     opts.abort.addEventListener("abort", abort, { once: true })

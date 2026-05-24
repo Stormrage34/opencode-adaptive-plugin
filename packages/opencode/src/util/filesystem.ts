@@ -20,6 +20,9 @@ export async function isDir(p: string): Promise<boolean> {
   }
 }
 
+// Sync version for startup/configuration checks where async overhead is not
+// worthwhile. Callers are in sync functions (shell resolution, editor detection).
+// Use statAsync in async codepaths where blocking would be noticeable.
 export function stat(p: string): ReturnType<typeof statSync> | undefined {
   return statSync(p, { throwIfNoEntry: false }) ?? undefined
 }
@@ -92,7 +95,7 @@ export async function writeStream(
     await mkdir(dir, { recursive: true })
   }
 
-  const nodeStream = stream instanceof ReadableStream ? Readable.fromWeb(stream as any) : stream
+  const nodeStream = stream instanceof ReadableStream ? Readable.fromWeb(stream as unknown as Parameters<typeof Readable.fromWeb>[0]) : stream
   const writeStream = createWriteStream(p)
   await pipeline(nodeStream, writeStream)
 

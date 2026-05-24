@@ -305,7 +305,7 @@ export const layer: Layer.Layer<
             Effect.orDie,
             Effect.map((exists) => (exists ? s : undefined)),
           ),
-        { concurrency: "unbounded" },
+        { concurrency: 20 },
       ).pipe(Effect.map((arr) => arr.filter((x): x is string => x !== undefined)))
 
       yield* db((d) =>
@@ -455,7 +455,7 @@ export const layer: Layer.Layer<
             Effect.orDie,
             Effect.map((ok) => (ok ? dir : undefined)),
           ),
-        { concurrency: "unbounded" },
+        { concurrency: 20 },
       ).pipe(Effect.map((arr) => arr.filter((x): x is string => x !== undefined)))
     })
 
