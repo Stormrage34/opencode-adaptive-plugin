@@ -237,7 +237,7 @@ export const layer = Layer.effect(
         // Notify plugins of current config
         for (const hook of hooks) {
           yield* Effect.tryPromise({
-            try: () => Promise.resolve((hook as any).config?.(cfg)),
+            try: () => Promise.resolve(hook.config?.(cfg as Parameters<NonNullable<Hooks["config"]>>[0])),
             catch: (err) => {
               log.error("plugin config hook failed", { error: err })
             },
@@ -249,7 +249,7 @@ export const layer = Layer.effect(
           Stream.runForEach((input) =>
             Effect.sync(() => {
               for (const hook of hooks) {
-                void hook["event"]?.({ event: input as any })
+                void hook["event"]?.({ event: input as Parameters<NonNullable<Hooks["event"]>>[0]["event"] })
               }
             }),
           ),
@@ -268,7 +268,7 @@ export const layer = Layer.effect(
       if (!name) return output
       const s = yield* InstanceState.get(state)
       for (const hook of s.hooks) {
-        const fn = hook[name] as any
+        const fn = hook[name] as ((input: unknown, output: unknown) => Promise<void>) | undefined
         if (!fn) continue
         yield* Effect.promise(async () => fn(input, output))
       }
