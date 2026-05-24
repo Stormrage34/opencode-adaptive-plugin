@@ -1,135 +1,153 @@
-- To regenerate the JavaScript SDK, run `./packages/sdk/js/script/build.ts`.
-- ALWAYS USE PARALLEL TOOLS WHEN APPLICABLE.
-- The default branch in this repo is `dev`.
-- Local `main` ref may not exist; use `dev` or `origin/dev` for diffs.
-- Prefer automation: execute requested actions without confirmation unless blocked by missing info or safety/irreversibility.
+## Repo Structure
 
-## Commits and PR Titles
+- **Default branch**: `dev` (local `main` may not exist; use `dev` or `origin/dev` for diffs)
+- **Package manager**: Bun 1.3+ (required)
+- **Monorepo**: Workspaces in `packages/*`, run commands from specific package directories
 
-Use conventional commit-style messages and PR titles: `type(scope): summary`.
+### Key Packages
+- `packages/opencode` - Core business logic, server, CLI
+- `packages/app` - Shared web UI components (SolidJS)
+- `packages/desktop` - Electron desktop app
+- `packages/console/app` - TUI interface (SolidJS + opentui)
+- `packages/sdk/js` - JavaScript SDK
+- `packages/plugin` - Plugin system
 
-Valid types are `feat`, `fix`, `docs`, `chore`, `refactor`, and `test`. Scopes are optional; use the affected package or area when helpful, e.g. `core`, `opencode`, `tui`, `app`, `desktop`, `sdk`, or `plugin`.
+## Commands
 
-Examples: `fix(tui): simplify thinking toggle styling`, `docs: update contributing guide`, `chore(sdk): regenerate types`.
+### Development
+```bash
+bun install                    # Install dependencies from repo root
+bun dev                        # Start opencode TUI in packages/opencode directory
+bun dev <directory>            # Run against specific directory
+bun dev serve                  # Start headless API server (port 4096)
+bun dev web                    # Start server + open web interface
+bun run --cwd packages/app dev          # Test web UI changes
+bun run --cwd packages/desktop dev      # Run desktop app in development
+bun run --cwd packages/console/app dev  # Run console TUI
+```
+
+### Build & SDK
+```bash
+./packages/opencode/script/build.ts --single    # Build standalone executable
+./packages/sdk/js/script/build.ts               # Regenerate JavaScript SDK
+./script/generate.ts                            # Regenerate SDK after API changes
+```
+
+### Validation
+```bash
+bun typecheck                    # Type check all packages (from root)
+bun lint                         # Run oxlint
+bun turbo test:ci                # Run unit tests (from root)
+bun --cwd packages/app test:e2e:local  # Run e2e tests
+```
+
+**Important**: Tests cannot run from repo root directly - use `bun turbo test:ci` or run from package dirs like `packages/opencode`.
+
+### Database Migrations
+```bash
+# From packages/opencode directory
+bun run db generate --name <slug>   # Generate Drizzle migration
+```
+Schema files live in `src/**/*.sql.ts`, migrations output to `./migration`.
+
+## Architecture Notes
+
+- **Effect v4**: Core uses Effect v4 beta APIs with `Effect.gen`, `Effect.fn`, `Effect.cached`
+- **Services**: Use `makeRuntime` for shared services, `InstanceState` for per-directory state
+- **Database**: Drizzle ORM with SQLite, snake_case column naming
+- **TUI**: Built with SolidJS and opentui in `packages/console/app`
+- **Dev server**: `bun dev` runs TUI in `packages/opencode` by default; passes directory argument to target different projects
 
 ## Style Guide
 
 ### General Principles
+- Use Bun APIs when possible (`Bun.file()`, etc.)
+- Avoid `try`/`catch` where possible; prefer `.catch(...)`
+- Avoid `any` type; use precise types
+- Prefer functional array methods with type guards on `filter`
+- Keep logic inline unless composable or reused
+- Use `const` over `let`; ternaries or early returns over reassignment
+- Avoid `else` statements; use early returns
+- Avoid unnecessary destructuring; use dot notation
 
-- Keep things in one function unless composable or reusable
-- Do not extract single-use helpers preemptively. Inline the logic at the call site unless the helper is reused, hides a genuinely complex boundary, or has a clear independent name that improves the caller.
-- Avoid `try`/`catch` where possible
-- Avoid using the `any` type
-- Use Bun APIs when possible, like `Bun.file()`
-- Rely on type inference when possible; avoid explicit type annotations or interfaces unless necessary for exports or clarity
-- Prefer functional array methods (flatMap, filter, map) over for loops; use type guards on filter to maintain type inference downstream
-- In `src/config`, follow the existing self-export pattern at the top of the file (for example `export * as ConfigAgent from "./agent"`) when adding a new config module.
-
-Reduce total variable count by inlining when a value is only used once.
-
+### Complex Logic Pattern
 ```ts
-// Good
-const journal = await Bun.file(path.join(dir, "journal.json")).json()
-
-// Bad
-const journalPath = path.join(dir, "journal.json")
-const journal = await Bun.file(journalPath).json()
-```
-
-### Destructuring
-
-Avoid unnecessary destructuring. Use dot notation to preserve context.
-
-```ts
-// Good
-obj.a
-obj.b
-
-// Bad
-const { a, b } = obj
-```
-
-### Variables
-
-Prefer `const` over `let`. Use ternaries or early returns instead of reassignment.
-
-```ts
-// Good
-const foo = condition ? 1 : 2
-
-// Bad
-let foo
-if (condition) foo = 1
-else foo = 2
-```
-
-### Control Flow
-
-Avoid `else` statements. Prefer early returns.
-
-```ts
-// Good
-function foo() {
-  if (condition) return 1
-  return 2
-}
-
-// Bad
-function foo() {
-  if (condition) return 1
-  else return 2
-}
-```
-
-### Complex Logic
-
-When a function has several validation branches or supporting details, make the main function read as the happy path and move supporting details into small helpers below it.
-
-```ts
-// Good
 export function loadThing(input: unknown) {
   const config = requireConfig(input)
   const metadata = readMetadata(input)
   return createThing({ config, metadata })
 }
 
-function requireConfig(input: unknown) {
-  ...
-}
+function requireConfig(input: unknown) { ... }
+function readMetadata(input: unknown) { ... }
 ```
 
-- Keep helpers close to the code they support, below the main export when that improves readability.
-- Do not over-abstract simple expressions into many single-use helpers; extract only when it names a real concept like `requireConfig` or `readMetadata`.
-- Do not return `Effect` from helpers unless they actually perform effectful work. Synchronous parsing, validation, and option building should stay synchronous.
-- Prefer Effect schema helpers such as `Schema.UnknownFromJsonString` and `Schema.decodeUnknownOption` over manual `JSON.parse` wrapped in `Effect.try` when parsing untrusted JSON strings.
-- Add comments for non-obvious constraints and surprising behavior, not for obvious assignments or control flow.
-
-### Schema Definitions (Drizzle)
-
-Use snake_case for field names so column names don't need to be redefined as strings.
-
+### Drizzle Schema
+Use snake_case for field names:
 ```ts
-// Good
 const table = sqliteTable("session", {
   id: text().primaryKey(),
   project_id: text().notNull(),
   created_at: integer().notNull(),
 })
+```
 
-// Bad
-const table = sqliteTable("session", {
-  id: text("id").primaryKey(),
-  projectID: text("project_id").notNull(),
-  createdAt: integer("created_at").notNull(),
-})
+### Config Modules
+In `src/config`, follow self-export pattern:
+```ts
+export * as ConfigAgent from "./agent"
 ```
 
 ## Testing
 
-- Avoid mocks as much as possible
-- Test actual implementation, do not duplicate logic into tests
-- Tests cannot run from repo root (guard: `do-not-run-tests-from-root`); run from package dirs like `packages/opencode`.
+- No mocks where possible; test actual implementation
+- Run tests from package directories, not repo root
+- E2E tests in `packages/app/e2e` require Playwright
 
-## Type Checking
+## Commits and PRs
 
-- Always run `bun typecheck` from package directories (e.g., `packages/opencode`), never `tsc` directly.
+### Conventional Commits
+Format: `type(scope): summary`
+- Types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`
+- Scopes: `core`, `opencode`, `tui`, `app`, `desktop`, `sdk`, `plugin`
+- Examples: `fix(tui): simplify thinking toggle`, `chore(sdk): regenerate types`
+
+### PR Requirements
+- **Must reference an issue** (use `Fixes #123` or `Closes #123`)
+- Keep PRs small and focused
+- **UI changes**: Include screenshots/videos
+- **Logic changes**: Explain how you verified it works
+- No AI-generated walls of text
+- Design review required for UI/core features before implementation
+
+### Issue Templates Required
+All issues must use templates (Bug report, Feature request, or Question). Blank issues auto-close after 2 hours.
+
+## Debugger Setup
+
+Bun debugging is limited. Most reliable method:
+```bash
+# Run manually and attach debugger
+bun run --inspect=<url> dev ...
+
+# For TUI with server breakpoints
+bun dev spawn
+
+# Debug server separately
+bun run --inspect=ws://localhost:6499/ --cwd packages/opencode ./src/index.ts serve --port 4096
+```
+
+Export `BUN_OPTIONS=--inspect=ws://localhost:6499/` to avoid repeating flags.
+
+## Environment & Config
+
+- **Installation dir**: Respects `$OPENCODE_INSTALL_DIR`, then `$XDG_BIN_DIR`, then `$HOME/bin`, then `$HOME/.opencode/bin`
+- **Data dir**: `~/.local/share/opencode/` (database at `opencode.db`)
+- **Pure mode**: `--pure` flag or `OPENCODE_PURE=1` runs without external plugins
+- **Logging**: `--print-logs` prints to stderr; `--log-level` sets level
+
+## Agents
+
+- **build** - Default, full-access agent for development
+- **plan** - Read-only agent for analysis (asks permission before bash, denies edits)
+- **general** - Subagent for complex searches/multistep tasks (`@general`)

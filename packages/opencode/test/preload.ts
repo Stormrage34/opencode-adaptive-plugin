@@ -79,14 +79,6 @@ delete process.env["OPENCODE_SERVER_USERNAME"]
 // Use in-memory sqlite
 process.env["OPENCODE_DB"] = ":memory:"
 
-// Now safe to import from src/
-const { Log } = await import("@opencode-ai/core/util/log")
-const { initProjectors } = await import("../src/server/projectors")
-
-void Log.init({
-  print: false,
-  dev: true,
-  level: "DEBUG",
-})
-
-initProjectors()
+// Note: Log.init() and initProjectors() are NOT called here to avoid global state pollution.
+// Test files that need logging should import and call Log.init() themselves.
+// Test files that need sync/event projectors should import and call initProjectors() from src/server/projectors.

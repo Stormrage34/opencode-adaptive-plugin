@@ -128,15 +128,18 @@ const liveEnv = TestConsole.layer
 
 export const it = make(testEnv, liveEnv)
 
-export const testEffect = <R, E>(layer: Layer.Layer<R, E>) =>
-  make(Layer.provideMerge(layer, testEnv), Layer.provideMerge(layer, liveEnv))
+export const testEffect = <R, E, R2 = never>(layer: Layer.Layer<R, E, R2>) =>
+  make(
+    Layer.provideMerge(layer, testEnv) as Layer.Layer<R, E, never>,
+    Layer.provideMerge(layer, liveEnv) as Layer.Layer<R, E, never>,
+  )
 
-// Variant of `testEffect` that builds the test layer through the shared
-// process-wide memoMap so services like Bus/Session resolve to the same
-// instances Server.Default uses. Use when a test needs pub/sub identity with
-// an in-process HTTP server — most tests should stick with `testEffect`.
-export const testEffectShared = <R, E>(layer: Layer.Layer<R, E>) =>
-  make(Layer.provideMerge(layer, testEnv), Layer.provideMerge(layer, liveEnv), sharedRun)
+export const testEffectShared = <R, E, R2 = never>(layer: Layer.Layer<R, E, R2>) =>
+  make(
+    Layer.provideMerge(layer, testEnv) as Layer.Layer<R, E, never>,
+    Layer.provideMerge(layer, liveEnv) as Layer.Layer<R, E, never>,
+    sharedRun,
+  )
 
 export const awaitWithTimeout = <A, E, R>(
   self: Effect.Effect<A, E, R>,
