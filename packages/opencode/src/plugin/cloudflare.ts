@@ -70,7 +70,7 @@ export async function CloudflareAIGatewayAuthPlugin(_input: PluginInput): Promis
       // back to the model's default output budget.
       if (!input.model.api.id.toLowerCase().startsWith("openai/")) return
       if (!input.model.capabilities.reasoning) return
-      output.maxOutputTokens = undefined
+      delete output.maxOutputTokens
     },
   }
 }

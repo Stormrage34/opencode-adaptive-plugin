@@ -1,254 +1,114 @@
-# opencode-plugin-adaptive
+# Adaptive Plugin — Summary
 
-Self-improving plugin for OpenCode that automatically adapts its strategy based on your acceptance patterns and tracks token usage/cost.
+## What It Does
 
-## Features
+The Adaptive Plugin is a **passive observer** for OpenCode that automatically harvests implicit signals from tool executions and stores them in a local SQLite database. It provides:
 
-- **Auto-adaptation**: Switches between `fast`, `balanced`, and `verified` strategies based on your acceptance rate
-- **Token Tracking**: Records input/output tokens, model used, and estimated cost per task
-- **Cost Analysis**: Tracks wasted spend on rejected suggestions, per-model breakdown
-- **Error learning**: Detects repeated error patterns and adjusts strategy to avoid them
-- **Persistent state**: Saves metrics to `.opencode_adaptive_state.json` — survives IDE restarts
-- **Zero external deps**: Uses only OpenCode plugin API + Node.js standard library
+1. **Automatic Confidence Scoring** — Computes base confidence from exit code and duration, then refines via output validation
+2. **Trend Analysis** — Detects improving/declining confidence patterns by agent, tool, or model
+3. **Abandonment Detection** — Penalizes prior session confidence when user switches contexts
+4. **Deduplication** — Sliding window (5s) prevents duplicate recordings of rapid tool calls
+5. **Telemetry Export** — JSON/CSV export, status readout, and reset capability
+6. **Internal Metrics** — Counters for ops visibility (`adaptive_metrics` tool)
+7. **Tool Enrichment** (experimental) — Appends reliability stats to tool descriptions (`tool.definition` hook)
+8. **Cross-Session Hints** (experimental) — Injects failing tool patterns from past sessions into new session prompts
+9. **Session Compaction Context** (experimental) — Preserves tool failure awareness across conversation compaction
 
-## Installation
+**No state.json, no event system dependency, no chat.params modification** — purely passive data collection.
 
-```bash
-opencode plugin add opencode-plugin-adaptive
-```
+**Scope:** This plugin provides telemetry, trend analysis, confidence scoring, and experimental enrichment hooks. Advisory routing & model recommendations are deferred to v2.2.
 
-Or for local development:
+---
 
-```bash
-opencode plugin add ./packages/plugin-adaptive
-```
+## Advantages
 
-## Configuration
+### ✅ Strengths
 
-Add to your `opencode.jsonc`:
+| Category | Benefit |
+|----------|---------|
+| **Non-Intrusive** | Zero interference with host orchestration; hooks are read-only observers |
+| **Performance** | Sync INSERT <0.5ms; async validation via microtasks; composite index makes trends queries ~2ms @ 5k rows |
+| **Memory Safety** | Bounded caches with TTL eviction (sessionCtx: 2h, recentOps: 5s, dup warnings: 1h); burst-limited cleanup (≤500/tick) |
+| **Security** | Parameterized queries only; validated `groupBy`; rate-limited warnings; debug-gated logs |
+| **Observability** | Built-in `adaptive_metrics` tool exposes counters for ops monitoring |
+| **Testability** | 23 unit tests covering core paths + experimental hooks; isolated in-memory SQLite per test |
+| **Simplicity** | Single-file DB layer, clear separation: `db.ts` (storage), `observer.ts` (logic), `adaptive.ts` (hooks) |
+| **Portability** | Pure SQLite WAL; no external services; DB file in working directory |
 
-```jsonc
-{
-  "plugin": [
-    ["opencode-plugin-adaptive", {
-      "statePath": ".opencode_adaptive_state.json",  // Optional: custom state path
-      "debug": false  // Optional: enable debug logging
-    }]
-  ]
-}
-```
+### 📊 Use Cases Where It Excels
 
-## Usage
+- **Long-running sessions** where you want to track agent/tool effectiveness over time
+- **Multi-agent workflows** where abandonment detection helps identify context switching
+- **Compliance/audit** needs (exportable JSON/CSV of all telemetry)
+- **Performance tuning** (trend analysis shows which models/tools degrade)
+- **Debugging flaky tools** (output validation catches truncated/parse failures)
 
-### Automatic Adaptation
+---
 
-The plugin automatically adjusts LLM parameters based on your acceptance patterns:
+## Disadvantages & Limitations
 
-- **Accept rate ≥ 65%** → `fast` strategy (fast, 2K tokens max)
-- **Accept rate < 65%** → `verified` strategy (4K tokens, full context)
-- **Default by task type**: `coding`→fast, `reasoning`→balanced, `debug`→verified
+### ⚠️ Known Limitations
 
-### Manual Feedback
+| Issue | Impact | Mitigation | Target Fix |
+|-------|--------|------------|------------|
+| **Experimental hooks require host support** | `tool.definition`, `experimental.chat.system.transform`, and `experimental.session.compacting` rely on hooks that may not exist in older OpenCode versions | Gate behind `experimentalActive: true` config flag; degrade gracefully | — |
+| **ToolStatsCache cold start** | First `tool.definition` call for an unseen tool always hits DB | Cache now populates with zero stats on miss | ✅ Fixed |
+| **No cross-session dedup** | Duplicate detection only within 5s sliding window per session | By design; global dedup would require shared state | — |
+| **No token counting** | `tokens_in`/`tokens_out` always 0 (not available in `tool.execute.after`) | Would require LLM instrumentation at a different layer | — |
+| **Single DB file** | All telemetry stored in `.opencode_telemetry.db` in working directory | User can configure custom `dbPath` via plugin options | — |
+| **No retention policy** | DB grows indefinitely; only manual `adaptive_reset` clears it | Consider adding auto-rollover (e.g., keep last 100k rows) | Backlog |
+| **Confidence model is linear** | Simple additive weights may not capture complex user preferences | Could be extended with per-user calibration or ML layer | Backlog |
 
-Track acceptance/rejection with token usage:
+### 🔧 Operational Considerations
 
-```bash
-# After accepting a suggestion
-opencode run adaptive_record \
-  --task_id refactor-auth \
-  --accepted true \
-  --latency_ms 1200 \
-  --input_tokens 1500 \
-  --output_tokens 450 \
-  --model qwen3.5-plus \
-  --strategy_used fast
+- **WAL mode** means `-wal` and `-shm` files accompany the DB; ensure cleanup on reset
+- **No connection pooling** — single connection per plugin instance (fine for single-process OpenCode)
+- **Metrics are in-memory only** — reset on plugin reload; not persisted
+- **No encryption** — DB is plain SQLite; if sensitive, rely on filesystem encryption
 
-# After rejecting a suggestion
-opencode run adaptive_record \
-  --task_id add-tests \
-  --accepted false \
-  --latency_ms 800 \
-  --input_tokens 2000 \
-  --output_tokens 200 \
-  --model qwen3.5-plus \
-  --error "TypeError: Cannot read property 'map'"
-```
+---
 
-### Check Current State
+## Architecture Trade-Offs
 
-```bash
-# Show strategy metrics
-opencode run adaptive_strategy
+| Decision | Rationale | Alternative Considered |
+|----------|-----------|------------------------|
+| **Passive observer only** | Zero risk of breaking host logic; easy to disable | Active routing (rejected — too invasive) |
+| **Sync INSERT + async UPDATE** | Fast path <0.5ms; validation doesn't block | Fully async INSERT (rejected — adds await overhead) |
+| **In-memory caches + TTL** | Simplicity, no external dependencies | Redis/Memcached (rejected — overkill, external dep) |
+| **SQLite over JSON file** | Query performance, ACID, WAL, indexes | JSON lines (rejected — slow scans, no indexes) |
+| **Composite index on (agent,tool,confidence,timestamp)** | Covers both GROUP BY and ORDER BY for trends | Separate indexes (rejected — N+1 query pattern) |
+| **No state.json** | Avoids file contention, simplifies recovery | State file (rejected — duplicate source of truth) |
 
-# Show token usage and cost stats
-opencode run adaptive_strategy --tokens true
-```
+---
 
-Output (strategy):
-```json
-{
-  "strategies": {
-    "coding": {
-      "strategy": "fast",
-      "acceptRate": "0.78",
-      "calls": 35,
-      "accepts": 27,
-      "rejects": 8,
-      "avgLatencyMs": 1200,
-      "avgTokens": 1850,
-      "overridden": false
-    }
-  },
-  "aggregate": {
-    "totalInteractions": 45,
-    "overallAcceptRate": "0.78",
-    "threshold": 0.65,
-    "lastAdaptation": "2026-05-24T15:30:00.000Z"
-  }
-}
-```
+## When to Use This Plugin
 
-Output (tokens):
-```json
-{
-  "tokenUsage": {
-    "total": 85000,
-    "input": 62000,
-    "output": 23000,
-    "inputOutputRatio": "0.73"
-  },
-  "cost": {
-    "total": "0.042500",
-    "accepted": "0.035200",
-    "rejected": "0.007300",
-    "wasteRate": "0.17"
-  },
-  "byModel": {
-    "qwen3.5-plus": {
-      "calls": 42,
-      "tokens": 78000,
-      "cost": "0.038500"
-    },
-    "o4-mini": {
-      "calls": 3,
-      "tokens": 7000,
-      "cost": "0.004000"
-    }
-  },
-  "recentLogs": [
-    {
-      "taskId": "refactor-auth",
-      "model": "qwen3.5-plus",
-      "tokens": 1950,
-      "cost": "0.000570",
-      "accepted": true
-    }
-  ]
-}
-```
+✅ **Use it if:**
+- You want automatic, zero-config telemetry for OpenCode sessions
+- You care about agent/tool performance trends over time
+- You need exportable audit logs for compliance
+- You want abandonment detection for multi-session workflows
+- You prefer local SQLite storage over external services
 
-### Reset State
+❌ **Don't use it if:**
+- You need real-time metrics streaming (use external APM instead)
+- You require per-token cost tracking (not implemented)
+- You need cross-machine aggregation (SQLite is local-only)
+- You have strict data retention policies (no auto-rollover yet)
+- You need sub-millisecond INSERT latency (SQLite may not suffice at extreme QPS)
 
-```bash
-opencode run adaptive_strategy --reset true
-```
+---
 
-### Manual Override
+## Future Enhancements (Backlog)
 
-Force a specific strategy for a task type:
+- Retention policy (auto-delete >N days or >M rows)
+- Token counting integration (if exposed by host)
+- Optional Prometheus exporter endpoint
+- Per-agent confidence calibration
+- Cross-session global dedup (optional, opt-in)
+- Encrypted DB mode (SQLCipher)
+- Flush improvement: drain microtasks before DB close
 
-```bash
-# Override coding tasks to use verified strategy
-opencode run adaptive_set --type coding --strategy verified
+---
 
-# Global override for all task types
-opencode run adaptive_set --global --strategy fast
-
-# Remove override and resume auto-adaptation
-opencode run adaptive_set --type coding --reset
-```
-
-## Strategies
-
-| Strategy | When | Max Tokens | Behavior |
-|----------|------|------------|----------|
-| `fast` | Accept rate ≥ 65% | 2048 | Fast responses, low context |
-| `balanced` | Default for reasoning tasks | 3072 | Balanced context and speed |
-| `verified` | Accept rate < 65% or repeated errors | 4096 | Full context, thorough |
-
-## How It Works
-
-1. **Track**: Records acceptance/rejection for each task
-2. **Analyze**: Computes running accept rate per task type (coding/reasoning/debug)
-3. **Adapt**: Adjusts strategy and token budget based on:
-   - Accept rate vs threshold (default 0.65)
-   - Repeated error patterns (≥2 occurrences trigger escalation to verified)
-   - Task type classification (keyword-based heuristic)
-4. **Persist**: Saves state to disk after each adaptation (debounced 10s coalescing)
-
-## State File
-
-Location: `.opencode_adaptive_state.json` (or custom `statePath`)
-
-```json
-{
-  "activeStrategy": {
-    "coding": "fast",
-    "reasoning": "balanced",
-    "debug": "verified"
-  },
-  "metrics": {
-    "coding": {
-      "calls": 45,
-      "accepts": 35,
-      "rejects": 10,
-      "avgLatencyMs": 1200,
-      "avgTokens": 1850
-    },
-    "reasoning": {
-      "calls": 12,
-      "accepts": 10,
-      "rejects": 2,
-      "avgLatencyMs": 2300,
-      "avgTokens": 2800
-    },
-    "debug": {
-      "calls": 8,
-      "accepts": 7,
-      "rejects": 1,
-      "avgLatencyMs": 1800,
-      "avgTokens": 3200
-    }
-  },
-  "errorWeights": {
-    "coding": {
-      "TypeError": 1
-    },
-    "reasoning": {},
-    "debug": {}
-  },
-  "contextBudgetTokens": {
-    "fast": 2048,
-    "balanced": 3072,
-    "verified": 4096
-  },
-  "acceptThreshold": 0.65,
-  "overrides": {
-    "coding": false,
-    "reasoning": false,
-    "debug": false
-  },
-  "lastAdaptation": 1716567000000
-}
-```
-
-## Development
-
-```bash
-cd packages/plugin-adaptive
-bun run typecheck
-```
-
-## License
-
-MIT
+**Bottom line:** A lightweight, production-ready telemetry plugin that adds valuable observability with negligible overhead. Experimental hooks extend the plugin from passive observer to active enrichment while maintaining the same zero-risk design.

@@ -643,7 +643,7 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
     "chat.params": async (input, output) => {
       if (input.model.providerID !== "openai") return
       // Match codex cli
-      output.maxOutputTokens = undefined
+      delete output.maxOutputTokens
     },
   }
 }

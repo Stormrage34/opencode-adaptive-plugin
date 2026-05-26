@@ -1,681 +1,497 @@
-// opencode-plugin-adaptive
-// Self-improving plugin for OpenCode that adapts strategy based on acceptance rates
-// https://github.com/opencode-ai/opencode
-// Version: 1.1.0-sqlite-telemetry
+// opencode-plugin-adaptive v2.0
+// Passive observer — harvests tool execution signals, stores to SQLite.
+// No chat.params modification, no EventV2 dependency, no state.json.
+// Strategy routing delegated to OMO-Slim.
 
 import { Plugin, tool } from "@opencode-ai/plugin"
 import path from "path"
-import fs from "fs/promises"
-import { Database } from "bun:sqlite"
+import { createTelemetryDb, queryStats, queryRecent, exportRecords, clearRecords, vacuumDb, closeDb, queryTrends, queryToolStats, queryFailingTools, type Database, type TrendResult } from "./db.js"
+import { observe, hashPrompt, type ObserverContext, type ToolResult } from "./observer.js"
+import { metrics } from "./metrics.js"
+import { RecentOpsCache } from "./recent-ops-cache.js"
+import { ToolStatsCache } from "./tool-stats-cache.js"
+import type { ObserverContext } from "./observer.js"
 
-// ============================================================================
-// Types
-// ============================================================================
-
-type Strategy = "fast" | "balanced" | "verified"
-type TaskType = "coding" | "reasoning" | "debug"
-
-interface PerTypeMetrics {
-  calls: number
-  accepts: number
-  rejects: number
-  avgLatencyMs: number
-  avgTokens: number
-  lastError?: string
+// Module-level debug logger
+let debugMode = false
+const log = (...args: any[]) => {
+  if (debugMode) console.log("[adaptive]", ...args)
 }
 
-interface PluginState {
-  activeStrategy: Record<TaskType, Strategy>
-  metrics: Record<TaskType, PerTypeMetrics>
-  errorWeights: Record<TaskType, Record<string, number>>
-  contextBudgetTokens: Record<Strategy, number>
-  acceptThreshold: number
-  lastAdaptation?: number
-  overrides: Record<TaskType, boolean>
-  modelPricing: Record<string, { input: number; output: number }>
+// Session TTL constants
+const SESSION_TTL = 2 * 60 * 60 * 1000 // 2 hours
+const CLEANUP_BURST_LIMIT = 500
+
+// Per-session state for Phase 2 (hints) and Phase 3 (compaction)
+interface SessionState {
+  ctx: ObserverContext
+  ts: number
+  lastRecordId?: number
+  hintsDelivered?: boolean
+  toolStats?: Map<string, { total: number; failed: number }>
 }
 
-const DEFAULT_STATE: PluginState = {
-  activeStrategy: {
-    coding: "fast",
-    reasoning: "balanced",
-    debug: "verified",
-  },
-  metrics: {
-    coding: { calls: 0, accepts: 0, rejects: 0, avgLatencyMs: 0, avgTokens: 0 },
-    reasoning: { calls: 0, accepts: 0, rejects: 0, avgLatencyMs: 0, avgTokens: 0 },
-    debug: { calls: 0, accepts: 0, rejects: 0, avgLatencyMs: 0, avgTokens: 0 },
-  },
-  errorWeights: {
-    coding: {},
-    reasoning: {},
-    debug: {},
-  },
-  contextBudgetTokens: {
-    fast: 2048,
-    balanced: 3072,
-    verified: 4096,
-  },
-  acceptThreshold: 0.65,
-  overrides: {
-    coding: false,
-    reasoning: false,
-    debug: false,
-  },
-  modelPricing: {
-    // Pricing per 1K tokens (USD)
-    "qwen3.5-plus": { input: 0.0002, output: 0.0006 },
-    "qwen3.5": { input: 0.0001, output: 0.0004 },
-    "o4-mini": { input: 0.001, output: 0.003 },
-    "claude-sonnet-4": { input: 0.0003, output: 0.0015 },
-    "gpt-4o": { input: 0.0005, output: 0.0015 },
-  },
-}
-
-// ============================================================================
-// Classifier (O(1) heuristic)
-// ============================================================================
-
-const DEBUG_KEYWORDS = ["error", "exception", "stack", "break", "fails", "failed", "bug", "crash"]
-const CODING_KEYWORDS = [
-  "syntax",
-  "imports",
-  "functions",
-  "diffs",
-  "refactor",
-  "implement",
-  "test",
-  "write",
-  "create",
-  "add",
-  "remove",
-  "update",
-  "function",
-  "class",
-  "module",
-  "component",
-]
-const REASONING_KEYWORDS = [
-  "explain",
-  "design",
-  "plan",
-  "compare",
-  "evaluate",
-  "architecture",
-  "analyze",
-  "review",
-  "discuss",
-  "why",
-  "how",
-  "what",
-  "understand",
-]
-
-function classify(prompt: string): TaskType {
-  const lower = prompt.toLowerCase()
-
-  // Debug takes priority - errors need verified strategy
-  if (DEBUG_KEYWORDS.some((k) => lower.includes(k))) {
-    return "debug"
+// Cleanup stale sessions; returns number of entries deleted
+export function cleanupSessions(sessionCtx: Map<string, SessionState>): number {
+  const now = Date.now()
+  let deleted = 0
+  // Copy keys to avoid iterator invalidation from concurrent chat.message writes
+  const ids = Array.from(sessionCtx.keys())
+  for (const id of ids) {
+    const entry = sessionCtx.get(id)
+    if (!entry) continue
+    if (now - entry.ts > SESSION_TTL) {
+      sessionCtx.delete(id)
+      deleted++
+      if (deleted >= CLEANUP_BURST_LIMIT) break
+    }
   }
-
-  // Coding keywords indicate implementation work
-  if (CODING_KEYWORDS.some((k) => lower.includes(k))) {
-    return "coding"
-  }
-
-  // Reasoning keywords indicate analysis/design work
-  if (REASONING_KEYWORDS.some((k) => lower.includes(k))) {
-    return "reasoning"
-  }
-
-  // Default to coding for most CLI tasks
-  return "coding"
+  return deleted
 }
 
-// ============================================================================
 // Plugin
-// ============================================================================
 
 export const AdaptivePlugin: Plugin = async (ctx, options) => {
-  const config = options as { statePath?: string; debug?: boolean; telemetryDb?: string } | undefined
-  const statePath = config?.statePath || path.join(ctx.directory, ".opencode_adaptive_state.json")
-  const telemetryDbPath = config?.telemetryDb || path.join(ctx.directory, ".opencode_telemetry.db")
-  const debug = config?.debug || false
-  let state = await loadState(statePath)
+  const config = options as { dbPath?: string; debug?: boolean; experimentalActive?: boolean; dedupWindow?: number } | undefined
 
-  // Initialize SQLite telemetry database with WAL mode for concurrent writes
-  let telemetryDb: Database | null = null
-  try {
-    telemetryDb = new Database(telemetryDbPath)
-    telemetryDb.run("PRAGMA journal_mode=WAL;")
-    telemetryDb.run("PRAGMA busy_timeout=5000;")
-    telemetryDb.run(`
-      CREATE TABLE IF NOT EXISTS telemetry (
-        id INTEGER PRIMARY KEY,
-        task_id TEXT NOT NULL,
-        model TEXT NOT NULL,
-        tokens_in INTEGER NOT NULL,
-        tokens_out INTEGER NOT NULL,
-        cost REAL NOT NULL,
-        exit_code INTEGER NOT NULL,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE INDEX IF NOT EXISTS idx_telemetry_task_id ON telemetry(task_id);
-    `)
-    log("[telemetry] SQLite initialized with WAL mode")
-  } catch (error) {
-    log("[telemetry] Failed to initialize SQLite, falling back to in-memory only:", error)
-    telemetryDb = null
-  }
+  const dbPath = config?.dbPath || path.join(ctx.directory, ".opencode_telemetry.db")
+  debugMode = config?.debug || false
+  const experimentalActive = config?.experimentalActive || false
 
-  // Async queue for telemetry writes (batch flush: 50 ops or 100ms)
-  const telemetryQueue: Array<() => void> = []
-  let flushTimer: NodeJS.Timeout | null = null
-  const TELEMETRY_BATCH_SIZE = 50
-  const TELEMETRY_FLUSH_INTERVAL = 100
+  // Initialize SQLite
+  const db = createTelemetryDb(dbPath)
+  log("[db] initialized at", dbPath)
 
-  const queueTelemetryWrite = (writeOp: () => void) => {
-    telemetryQueue.push(writeOp)
-    
-    if (telemetryQueue.length >= TELEMETRY_BATCH_SIZE) {
-      flushTelemetryQueue()
-    } else if (!flushTimer) {
-      flushTimer = setTimeout(flushTelemetryQueue, TELEMETRY_FLUSH_INTERVAL)
+  // (pendingValidations removed in favor of fire-and-forget microtasks — telemetry is best-effort)
+
+  // Session context cache — maps sessionID → observer context
+  // Populated by chat.message, consumed by tool.execute.after
+  // TTL: 2hr, cleanup every 30min (non-blocking with yield)
+  const sessionCtx = new Map<string, SessionState>()
+  const CLEANUP_INTERVAL = 30 * 60 * 1000 // 30 minutes
+  let isCleaning = false
+  const TTL = setInterval(async () => {
+    if (isCleaning) return
+    isCleaning = true
+    const deleted = cleanupSessions(sessionCtx)
+    metrics.ttlCleanupRuns++
+    metrics.ttlRecordsDeleted += deleted
+    isCleaning = false
+  }, CLEANUP_INTERVAL)
+  if (TTL.unref) TTL.unref()
+
+  // Periodic cleanup for duplicateWarningTimestamps to prevent unbounded growth
+  const DUP_WARN_CLEANUP = setInterval(() => {
+    if (duplicateWarningTimestamps.size === 0) return
+    const now = Date.now()
+    // Copy keys to avoid iterator invalidation from concurrent writeRecord writes
+    const keys = Array.from(duplicateWarningTimestamps.keys())
+    for (const key of keys) {
+      const ts = duplicateWarningTimestamps.get(key)
+      if (ts && now - ts > 3600_000) duplicateWarningTimestamps.delete(key)
     }
-  }
+  }, 3600_000)
+  if (DUP_WARN_CLEANUP.unref) DUP_WARN_CLEANUP.unref()
 
-  const flushTelemetryQueue = () => {
-    if (flushTimer) {
-      clearTimeout(flushTimer)
-      flushTimer = null
-    }
+  // 5s sliding window dedup — tracks (sessionID:toolName) timestamps using an efficient TTL cache
+  // Configurable via plugin options for testing
+  const DEDUP_WINDOW = config?.dedupWindow ?? 5000
+  const recentOps = new RecentOpsCache(DEDUP_WINDOW)
 
-    if (telemetryQueue.length === 0 || !telemetryDb) return
+  // Periodic cleanup for recentOps to prevent unbounded growth
+  const RECENTOPS_CLEANUP_INTERVAL = 60 * 1000 // 60 seconds
+  const recentOpsCleanup = setInterval(() => {
+    recentOps.cleanup()
+  }, RECENTOPS_CLEANUP_INTERVAL)
+  if (recentOpsCleanup.unref) recentOpsCleanup.unref()
 
-    const batch = [...telemetryQueue]
-    telemetryQueue.length = 0
+  // ── ToolStatsCache — zero-DB-IO enrichment layer ──
+  const toolStatsCache = new ToolStatsCache()
 
-    try {
-      telemetryDb.transaction(() => {
-        for (const writeOp of batch) {
-          writeOp()
-        }
-      })
-      log(`[telemetry] Flushed ${batch.length} ops to SQLite`)
-    } catch (error) {
-      log("[telemetry] Batch flush failed:", error)
-      // Re-queue failed ops at the front
-      telemetryQueue.unshift(...batch)
-    }
-  }
-
-  // Flush on process exit
-  process.on("beforeExit", () => {
-    flushTelemetryQueue()
-    if (telemetryDb) {
-      telemetryDb.close()
-    }
-  })
-
-  // Debounce timer for JSON state writes
-  let jsonStateTimer: NodeJS.Timeout | null = null
-
-  const log = (...args: any[]) => {
-    if (debug) console.log("[adaptive]", ...args)
-  }
-
-  // Debounced save - coalesces writes within 10s window
-  const scheduleSave = () => {
-    if (jsonStateTimer) clearTimeout(jsonStateTimer)
-    jsonStateTimer = setTimeout(async () => {
-      await saveState(statePath, state)
-      jsonStateTimer = null
-    }, 10000)
-  }
-
-  // Immediate flush (for process exit)
-  const flush = async () => {
-    if (jsonStateTimer) {
-      clearTimeout(jsonStateTimer)
-      jsonStateTimer = null
-    }
-    await saveState(statePath, state)
-  }
-
-  // Public API for agents - resolve strategy from prompt
-  const resolveStrategy = (prompt: string): Strategy => {
-    const type = classify(prompt)
-    return state.activeStrategy[type]
-  }
-
-  // Internal record function (called by hooks and tools)
-  const record = (
-    taskType: TaskType,
-    accepted: boolean,
-    latencyMs: number,
-    tokensUsed: number,
-    strategyUsed: Strategy,
-    error?: string,
-  ) => {
-    const metrics = state.metrics[taskType]
-
-    metrics.calls += 1
-    if (accepted) {
-      metrics.accepts += 1
-    } else {
-      metrics.rejects += 1
-    }
-
-    // Running averages
-    metrics.avgLatencyMs = ((metrics.calls - 1) * metrics.avgLatencyMs + latencyMs) / metrics.calls
-    metrics.avgTokens = ((metrics.calls - 1) * metrics.avgTokens + tokensUsed) / metrics.calls
-
-    if (error) {
-      const errorKey = error.split(":")[0].trim()
-      state.errorWeights[taskType][errorKey] = (state.errorWeights[taskType][errorKey] || 0) + 1
-
-      // Adapt on repeated errors (≥2 occurrences)
-      if (state.errorWeights[taskType][errorKey] >= 2 && !state.overrides[taskType]) {
-        const oldStrategy = state.activeStrategy[taskType]
-        state.activeStrategy[taskType] = "verified"
-        state.contextBudgetTokens.verified = Math.max(
-          2000,
-          Math.floor(state.contextBudgetTokens.verified * 0.85),
-        )
-        log(`[${taskType}] Adapted: ${oldStrategy} → verified, budget ${state.contextBudgetTokens.verified}`)
+  // 30s refresh: query DB for dirty tools and populate cache
+  const CACHE_REFRESH_INTERVAL = 30_000
+  const cacheRefresher = setInterval(() => {
+    const dirty = toolStatsCache.getDirty()
+    if (dirty.length === 0) return
+    metrics.cacheRefreshRuns++
+    for (const toolName of dirty) {
+      const stats = queryToolStats(db, toolName)
+      if (stats) {
+        toolStatsCache.set(toolName, { successRate: stats.successRate, totalCalls: stats.totalCalls })
+        metrics.cacheRefreshed++
       }
     }
+  }, CACHE_REFRESH_INTERVAL)
+  if (cacheRefresher.unref) cacheRefresher.unref()
 
-    // Adaptation logic (only if not overridden)
-    if (!state.overrides[taskType]) {
-      const acceptRate = metrics.accepts / Math.max(1, metrics.calls)
-      const threshold = state.acceptThreshold
+  // 30s cleanup: evict entries untouched for 60s
+  const cacheCleaner = setInterval(() => {
+    const evicted = toolStatsCache.cleanup()
+    metrics.cacheEvictions += evicted
+  }, CACHE_REFRESH_INTERVAL)
+  if (cacheCleaner.unref) cacheCleaner.unref()
 
-      // Escalate when accept rate drops below threshold - 0.1
-      if (acceptRate < threshold - 0.1 && state.activeStrategy[taskType] !== "verified") {
-        const oldStrategy = state.activeStrategy[taskType]
-        state.activeStrategy[taskType] = "verified"
-        log(`[${taskType}] Escalated: ${oldStrategy} → verified (accept rate ${acceptRate.toFixed(2)})`)
-      }
+  // ── Tools ──
 
-      // Downgrade when accept rate exceeds threshold + 0.15
-      if (acceptRate > threshold + 0.15 && state.activeStrategy[taskType] === "verified") {
-        state.activeStrategy[taskType] = "balanced"
-        log(`[${taskType}] Downgraded: verified → balanced (accept rate ${acceptRate.toFixed(2)})`)
-      }
-    }
-
-    scheduleSave()
-  }
-
-  // Tool to record feedback (mandatory post-execution)
+  // Manual feedback recording (fallback for auto-observer)
   const recordFeedback = tool({
-    description:
-      "Record user feedback on a suggestion. MUST be called after every AI suggestion. Call this after accepting or rejecting an AI suggestion.",
+    description: "Record explicit feedback for a task outcome. Use when the auto-observer signal needs correction.",
     args: {
-      task_type: tool.schema.enum(["coding", "reasoning", "debug"]).describe("Task type (auto-detected if omitted)"),
-      accepted: tool.schema.boolean().describe("Whether the suggestion was accepted"),
-      latency_ms: tool.schema.number().describe("Latency in milliseconds"),
-      input_tokens: tool.schema.number().describe("Input/prompt token count"),
-      output_tokens: tool.schema.number().describe("Output/completion token count"),
-      model: tool.schema.string().describe("Model used (e.g., qwen3.5-plus, o4-mini)"),
-      strategy_used: tool.schema.enum(["fast", "balanced", "verified"]).describe("Strategy that was used"),
-      task_id: tool.schema.string().optional().describe("Task identifier for tracking"),
-      error: tool.schema.string().optional().describe("Error message if the operation failed"),
+      task_id: tool.schema.string().optional().describe("Task identifier"),
+      prompt: tool.schema.string().optional().describe("Original prompt text"),
+      model: tool.schema.string().optional().describe("Model used"),
+      agent: tool.schema.string().optional().describe("Agent used"),
+      tool_name: tool.schema.string().optional().describe("Tool used"),
+      confidence: tool.schema.number().describe("Confidence score (0.0-1.0)"),
+      exit_code: tool.schema.number().optional().describe("Exit code (0=success)"),
     },
     async execute(args) {
-      const taskType = args.task_type || classify(args.strategy_used || "coding")
-      const totalTokens = args.input_tokens + args.output_tokens
-      
-      // Calculate cost based on model pricing
-      const pricing = state.modelPricing[args.model] || state.modelPricing["qwen3.5-plus"]
-      const estimatedCost = (args.input_tokens / 1000) * pricing.input + (args.output_tokens / 1000) * pricing.output
-      
-      // Record to SQLite telemetry (async queue, fire-and-forget)
-      const taskId = args.task_id || `task_${Date.now()}`
-      const exitCode = args.accepted ? 0 : 1
-      
-      queueTelemetryWrite(() => {
-        telemetryDb!.run(
-          "INSERT INTO telemetry (task_id, model, tokens_in, tokens_out, cost, exit_code) VALUES (?, ?, ?, ?, ?, ?)",
-          taskId,
-          args.model,
-          args.input_tokens,
-          args.output_tokens,
-          estimatedCost,
-          exitCode,
-        )
+      const confidence = Math.min(1, Math.max(0, args.confidence))
+      observe(db, {
+        promptHash: args.prompt ? hashPrompt(args.prompt) : undefined,
+        model: args.model,
+        agent: args.agent,
+      }, {
+        toolName: args.tool_name || "manual",
+        exitCode: args.exit_code ?? (confidence >= 0.5 ? 0 : 1),
+        output: "",
       })
-      
-      log(`[telemetry] Queued: ${taskId} ${args.model} ${totalTokens} tokens $${estimatedCost.toFixed(6)}`)
-      
-      // Legacy: also record to per-type metrics (for strategy adaptation)
-      record(taskType, args.accepted, args.latency_ms, totalTokens, args.strategy_used || "fast", args.error)
-
-      const metrics = state.metrics[taskType]
-      const acceptRate = metrics.accepts / Math.max(1, metrics.calls)
-
-      log(`[${taskType}] ${acceptRate.toFixed(2)} accept rate (${metrics.accepts}/${metrics.calls})`)
-
-      return JSON.stringify({
-        recorded: true,
-        taskType,
-        acceptRate: acceptRate.toFixed(2),
-        strategy: state.activeStrategy[taskType],
-        cost: estimatedCost.toFixed(6),
-        totalTokens,
-        telemetry: "sqlite",
-      })
+      return JSON.stringify({ recorded: true, confidence: confidence.toFixed(2) })
     },
   })
 
-  // Tool to get current strategy and metrics (per-type breakdown)
-  const getStrategy = tool({
-    description: "Get the current adaptive strategy and metrics per task type",
+  // Telemetry status readout
+  const status = tool({
+    description: "Show telemetry stats, recent records, and observer health.",
     args: {
-      reset: tool.schema.boolean().optional().describe("Reset all metrics and state"),
-      tokens: tool.schema.boolean().optional().describe("Show token usage and cost statistics"),
+      recent: tool.schema.boolean().optional().describe("Show recent records"),
+      plain: tool.schema.boolean().optional().describe("Return plain text (not JSON)"),
     },
     async execute(args) {
-      if (args.reset) {
-        state = { ...DEFAULT_STATE }
-        await flush()
-        return "State reset to defaults"
-      }
+      const stats = queryStats(db)
+      const recent = args.recent ? queryRecent(db, 10) : []
 
-      // Show token stats if requested
-      if (args.tokens) {
-        if (!telemetryDb) {
-          return "Telemetry database not initialized"
-        }
-        
-        // Query aggregate stats from SQLite
-        const totals = telemetryDb
-          .query("SELECT SUM(tokens_in) as input, SUM(tokens_out) as output, SUM(cost) as total FROM telemetry")
-          .get() as { input: number | null; output: number | null; total: number | null }
-        
-        const totalTokens = (totals.input || 0) + (totals.output || 0)
-        const inputTokens = totals.input || 0
-        const outputTokens = totals.output || 0
-        const totalCost = totals.total || 0
-        
-        // Accept/reject cost analysis (exit_code: 0=accepted, 1=rejected)
-        const acceptedStats = telemetryDb
-          .query("SELECT SUM(cost) as cost FROM telemetry WHERE exit_code = 0")
-          .get() as { cost: number | null }
-        const rejectedStats = telemetryDb
-          .query("SELECT SUM(cost) as cost FROM telemetry WHERE exit_code = 1")
-          .get() as { cost: number | null }
-        
-        const acceptedCost = acceptedStats.cost || 0
-        const rejectedCost = rejectedStats.cost || 0
-        
-        // Model breakdown
-        const modelRows = telemetryDb
-          .query("SELECT model, COUNT(*) as calls, SUM(tokens_in + tokens_out) as tokens, SUM(cost) as cost FROM telemetry GROUP BY model ORDER BY cost DESC")
-          .all() as Array<{ model: string; calls: number; tokens: number; cost: number }>
-        
-        const modelStats: Record<string, { calls: number; tokens: number; cost: number }> = {}
-        for (const row of modelRows) {
-          modelStats[row.model] = {
-            calls: row.calls,
-            tokens: row.tokens,
-            cost: row.cost,
+      if (args.plain) {
+        if (!stats) return "No telemetry data yet."
+        const lines = [
+          `Telemetry: ${stats.totalRecords} records`,
+          `Avg confidence: ${stats.avgConfidence.toFixed(2)}`,
+          `  High (≥0.7): ${stats.recordsByConfidence.high}`,
+          `  Med (0.4-0.7): ${stats.recordsByConfidence.medium}`,
+          `  Low (<0.4): ${stats.recordsByConfidence.low}`,
+          `By agent: ${Object.entries(stats.recordsByAgent).map(([k, v]) => `${k}=${v}`).join(", ") || "none"}`,
+          `By tool: ${Object.entries(stats.recordsByTool).map(([k, v]) => `${k}=${v}`).join(", ") || "none"}`,
+        ]
+        if (recent.length > 0) {
+          lines.push("", "Recent:")
+          for (const r of recent) {
+            lines.push(`  #${r.id} | ${String(r.tool_name || r.agent || "?").padEnd(12)} | conf=${Number(r.confidence).toFixed(2)} | exit=${r.exit_code} | ${r.timestamp}`)
           }
         }
-        
-        // Recent logs (last 10)
-        const recentRows = telemetryDb
-          .query("SELECT task_id, model, tokens_in + tokens_out as tokens, cost, exit_code FROM telemetry ORDER BY id DESC LIMIT 10")
-          .all() as Array<{ task_id: string; model: string; tokens: number; cost: number; exit_code: number }>
-        
-        return JSON.stringify({
-          tokenUsage: {
-            total: totalTokens,
-            input: inputTokens,
-            output: outputTokens,
-            inputOutputRatio: totalTokens > 0 ? (inputTokens / totalTokens).toFixed(2) : "0.00",
-          },
-          cost: {
-            total: totalCost.toFixed(6),
-            accepted: acceptedCost.toFixed(6),
-            rejected: rejectedCost.toFixed(6),
-            wasteRate: totalCost > 0 ? (rejectedCost / totalCost).toFixed(2) : "0.00",
-          },
-          byModel: modelStats,
-          recentLogs: recentRows.map(row => ({
-            taskId: row.task_id,
-            model: row.model,
-            tokens: row.tokens,
-            cost: row.cost.toFixed(6),
-            accepted: row.exit_code === 0,
-          })),
-        }, null, 2)
+        return lines.join("\n")
       }
 
-      const result: Record<TaskType, any> = {} as any
-      const totalCalls = Object.values(state.metrics).reduce((sum, m) => sum + m.calls, 0)
-      const totalAccepts = Object.values(state.metrics).reduce((sum, m) => sum + m.accepts, 0)
-
-      for (const type of ["coding", "reasoning", "debug"] as TaskType[]) {
-        const metrics = state.metrics[type]
-        const acceptRate = metrics.calls > 0 ? metrics.accepts / metrics.calls : 0
-        result[type] = {
-          strategy: state.activeStrategy[type],
-          acceptRate: acceptRate.toFixed(2),
-          calls: metrics.calls,
-          accepts: metrics.accepts,
-          rejects: metrics.rejects,
-          avgLatencyMs: Math.round(metrics.avgLatencyMs),
-          avgTokens: Math.round(metrics.avgTokens),
-          overridden: state.overrides[type],
-        }
-      }
-
-      return JSON.stringify(
-        {
-          strategies: result,
-          aggregate: {
-            totalInteractions: totalCalls,
-            overallAcceptRate: totalCalls > 0 ? (totalAccepts / totalCalls).toFixed(2) : "0.00",
-            threshold: state.acceptThreshold,
-            contextBudgets: state.contextBudgetTokens,
-            lastAdaptation: state.lastAdaptation ? new Date(state.lastAdaptation).toISOString() : "never",
-          },
-        },
-        null, 2,
-      )
+      return JSON.stringify({ stats, recent }, null, 2)
     },
   })
 
-  // Tool to manually set strategy (per-type or global)
-  const setStrategy = tool({
-    description: "Manually set the adaptive strategy (per-type or global override)",
+  // Export telemetry data
+  const EXPORT_HARD_CAP = 50_000
+  const exportData = tool({
+    description: "Export all telemetry records as JSON or CSV.",
     args: {
-      type: tool.schema.enum(["coding", "reasoning", "debug"]).optional().describe("Task type to override"),
-      strategy: tool.schema.enum(["fast", "balanced", "verified"]).describe("Strategy to use"),
-      global: tool.schema.boolean().optional().describe("Apply to all task types"),
-      reset: tool.schema.boolean().optional().describe("Remove override and resume auto-adaptation"),
+      format: tool.schema.enum(["json", "csv"]).optional().describe("Export format (default: json)"),
+      limit: tool.schema.number().optional().describe("Max rows (default: 10000)"),
+      all: tool.schema.boolean().optional().describe("Export all rows (capped at 50000)"),
     },
     async execute(args) {
-      if (args.reset) {
-        if (args.type) {
-          state.overrides[args.type] = false
-          return `Override removed for ${args.type}, auto-adaptation resumed`
-        }
-        // Reset all
-        state.overrides = { coding: false, reasoning: false, debug: false }
-        return "All overrides removed, auto-adaptation resumed"
-      }
-
-      const strategy = args.strategy!
-
-      if (args.global) {
-        for (const type of ["coding", "reasoning", "debug"] as TaskType[]) {
-          state.activeStrategy[type] = strategy
-          state.overrides[type] = true
-        }
-        await flush()
-        return `Global override set to ${strategy} for all task types`
-      }
-
-      const type = args.type || "coding"
-      state.activeStrategy[type] = strategy
-      state.overrides[type] = true
-      await flush()
-      return `Strategy for ${type} set to ${strategy} (override active)`
+      const limit = args.all ? EXPORT_HARD_CAP : (args.limit ?? 10_000)
+      if (limit > EXPORT_HARD_CAP) throw new Error(`Export capped at ${EXPORT_HARD_CAP} rows. Use SQLite CLI for full dumps.`)
+      return exportRecords(db, (args.format as "json" | "csv") || "json", limit)
     },
   })
 
-  // Periodic RAM tracking (5min interval, debug only)
-  if (debug) {
-    const ramInterval = setInterval(async () => {
-      const mem = process.memoryUsage()
-      log(`RAM: heap ${Math.round(mem.heapUsed / 1024 / 1024)}MB, rss ${Math.round(mem.rss / 1024 / 1024)}MB`)
-    }, 300000).unref()
-
-    // Cleanup on process exit
-    process.on("exit", () => {
-      clearInterval(ramInterval)
+   // Reset telemetry
+    const reset = tool({
+      description: "Clear all telemetry records. VACUUM runs only when --force is supplied.",
+      args: {
+        force: tool.schema.boolean().optional().describe("Run VACUUM after clear (default: skip)"),
+      },
+      async execute(args) {
+        clearRecords(db)
+        if (args.force) {
+          vacuumDb(db) // sync, user‑requested
+          return "Telemetry cleared. (VACUUM sync)"
+        }
+        return "Telemetry cleared. (VACUUM skipped)"
+      },
     })
-  }
 
-  // Ensure state is flushed on process exit
-  process.on("beforeExit", () => {
-    flush()
-  })
+   // Trend analysis
+   const trends = tool({
+     description: "Analyze confidence trends by agent, tool, or model.",
+     args: {
+       groupBy: tool.schema.enum(["agent", "tool", "model"]).describe("Dimension to group by"),
+       limit: tool.schema.number().optional().describe("Max groups to return (default: 20)"),
+     },
+     async execute(args) {
+let result: TrendResult[]
+        try {
+          result = queryTrends(db, {
+            groupBy: args.groupBy as "agent" | "tool" | "model",
+            limit: args.limit ?? 20,
+          })
+        } catch (e) {
+          // Return a JSON‑encoded error object so callers can always parse the output
+          return JSON.stringify({ error: (e as Error).message })
+        }
+        if (!result || result.length === 0) {
+          return JSON.stringify("No trend data available (need at least 2 records per group).")
+        }
+        return JSON.stringify(result, null, 2)
+      },
+    })
 
-  return {
-    // Public API exposed for agent integration
-    resolveStrategy,
-    flush,
+    // Internal metrics (for debugging and monitoring)
+    const metricsTool = tool({
+      description: "Return internal plugin metrics (counters). Debug use only.",
+      args: {},
+      async execute(args) {
+        return JSON.stringify({
+          totalInserted: metrics.totalInserted,
+          duplicateAttempts: metrics.duplicateAttempts,
+          duplicateWarnings: metrics.duplicateWarnings,
+          ttlCleanupRuns: metrics.ttlCleanupRuns,
+          ttlRecordsDeleted: metrics.ttlRecordsDeleted,
+          queryStatsCalls: metrics.queryStatsCalls,
+          queryRecentCalls: metrics.queryRecentCalls,
+          queryTrendsCalls: metrics.queryTrendsCalls,
+          queryToolStatsCalls: metrics.queryToolStatsCalls,
+          cacheHits: metrics.cacheHits,
+          cacheMisses: metrics.cacheMisses,
+          cacheRefreshRuns: metrics.cacheRefreshRuns,
+          cacheRefreshed: metrics.cacheRefreshed,
+          cacheEvictions: metrics.cacheEvictions,
+          hintsDelivered: metrics.hintsDelivered,
+          compactionContextsInjected: metrics.compactionContextsInjected,
+          abandonmentPenalties: metrics.abandonmentPenalties,
+          dbErrors: metrics.dbErrors,
+          validationQueueDrops: metrics.validationQueueDrops,
+        }, null, 2)
+      },
+    })
 
-    tool: {
-      adaptive_record: recordFeedback,
-      adaptive_strategy: getStrategy,
-      adaptive_set: setStrategy,
+  // ── Hooks ──
+
+    return {
+        flush: () => {
+          // Clear periodic timers to prevent leaks on plugin reload
+          if (TTL) clearInterval(TTL)
+          if (DUP_WARN_CLEANUP) clearInterval(DUP_WARN_CLEANUP)
+          if (recentOpsCleanup) clearInterval(recentOpsCleanup)
+          if (cacheRefresher) clearInterval(cacheRefresher)
+          if (cacheCleaner) clearInterval(cacheCleaner)
+
+        // Close DB (validation microtasks are fire-and-forget — telemetry is best-effort)
+        closeDb(db)
+      },
+
+     tool: {
+       adaptive_record: recordFeedback,
+       adaptive_status: status,
+       adaptive_export: exportData,
+       adaptive_reset: reset,
+       adaptive_trends: trends,
+       adaptive_metrics: metricsTool,
+     },
+
+    // Passive context cache — stores session metadata for downstream observer
+     async "chat.message"(input, _output) {
+       if (!input.sessionID) return
+
+       // Implicit abandonment detection: if another recent session exists, penalize it
+      const ABANDONMENT_WINDOW_MS = 5 * 60 * 1000 // 5 minutes
+      const ABANDONMENT_PENALTY = 0.10
+      const now = Date.now()
+      let candidate: { id: string; entry: { ctx: ObserverContext; ts: number; lastRecordId?: number } } | null = null
+      for (const [id, entry] of sessionCtx) {
+        if (id === input.sessionID) continue
+        if (now - entry.ts < ABANDONMENT_WINDOW_MS) {
+          if (!candidate || entry.ts > candidate.entry.ts) {
+            candidate = { id, entry }
+          }
+        }
+      }
+      if (candidate && candidate.entry.lastRecordId != null) {
+        // Only penalize if current confidence > 0.65 (avoid stacking on already low confidence)
+        // NOTE: params must go to .get(), not .query() (Bun SQLite API requirement)
+        const current = db.query(
+          "SELECT confidence FROM telemetry_v2 WHERE id = ?"
+        ).get(candidate.entry.lastRecordId) as { confidence: number } | null
+        if (debugMode) log(`[abandonment] candidate ${candidate.id.slice(0, 8)}… id=${candidate.entry.lastRecordId} conf=${current?.confidence}`)
+        if (current && current.confidence > 0.65) {
+          db.run(
+            "UPDATE telemetry_v2 SET confidence = MAX(0, confidence - ?) WHERE id = ?",
+            ABANDONMENT_PENALTY,
+            candidate.entry.lastRecordId
+          )
+          metrics.abandonmentPenalties++
+          log(`[abandonment] penalized session ${candidate.id.slice(0, 8)}… confidence -${ABANDONMENT_PENALTY}`)
+        }
+        sessionCtx.delete(candidate.id)
+      }
+
+      // Extract model info
+      const model = input.model?.modelID || undefined
+
+       // Store session context for tool.execute.after correlation
+        sessionCtx.set(input.sessionID, {
+          ctx: {
+            model,
+            agent: input.agent,
+          },
+          ts: Date.now(),
+          toolStats: new Map(),
+        })
+       log(`[chat.message] sessionCtx[${input.sessionID.slice(0, 8)}…] model=${model ?? "?"} agent=${input.agent ?? "?"}`)
     },
 
-    // Adjust LLM parameters based on current strategy (per-task-type)
-    async "chat.params"(input, output) {
-      const prompt = input.prompt || ""
-      
-      // Skip token limiting for subagents — they need full output budget for comprehensive work
-      // Subagents: librarian, explorer, oracle, designer, fixer, general, councillor
-      const isSubagent = input.agent && 
-        ['librarian', 'explorer', 'oracle', 'designer', 'fixer', 'general', 'councillor'].includes(input.agent)
-      
-      if (isSubagent) {
-        log(`[subagent:${input.agent}] skipping token limit, maxOutputTokens=${output.maxOutputTokens}`)
+    // Auto-observer — fires after every tool execution
+    async "tool.execute.after"(input, output) {
+      // 5s sliding window dedup: skip if same tool called within window
+      const dedupKey = `${input.sessionID}:${input.tool}`
+      const lastTs = recentOps.get(dedupKey)
+      const now = Date.now()
+      if (lastTs && (now - lastTs) < DEDUP_WINDOW) {
+        if (debugMode) log(`[dedup] skipped ${dedupKey} — ${now - lastTs}ms ago`)
         return
       }
-      
-      const taskType = classify(prompt)
-      const strategy = state.activeStrategy[taskType]
-      const maxTokens = state.contextBudgetTokens[strategy]
+      recentOps.set(dedupKey, now)
 
-      const currentMax = typeof output.maxOutputTokens === "number" ? output.maxOutputTokens : 4096
-      output.maxOutputTokens = Math.floor(Math.min(currentMax, maxTokens))
-      log(`[${taskType}] ${strategy} strategy, maxOutputTokens=${output.maxOutputTokens}`)
-      // Note: Don't return output - modify in place like other plugins
-    },
-
-    // Track context size for potential optimization
-    async "chat.message"(input, output) {
-      const contextSize =
-        output.parts?.reduce((sum, p) => sum + (p?.type === "text" && p?.content ? p.content.length : 0), 0) || 0
-
-      const prompt = input.prompt || ""
-      const taskType = classify(prompt)
-      const strategy = state.activeStrategy[taskType]
-      const budget = state.contextBudgetTokens[strategy] * 4
-
-      if (contextSize > budget) {
-        log(`[${taskType}] Context ${contextSize} chars exceeds budget ${budget} chars`)
-      }
-      // Note: Don't return output - modify in place like other plugins
-    },
-  }
-}
-
-// ============================================================================
-// State persistence
-// ============================================================================
-
-async function loadState(filePath: string): Promise<PluginState> {
-  try {
-    const content = await fs.readFile(filePath, "utf-8")
-    const parsed = JSON.parse(content)
-
-    // Migration: detect old flat format (string) and convert to per-type
-    if (typeof parsed.activeStrategy === "string") {
-      const oldStrategy = parsed.activeStrategy as string
-      parsed.activeStrategy = {
-        coding: oldStrategy,
-        reasoning: oldStrategy,
-        debug: oldStrategy,
-      }
-    }
-
-    // Migration: rename old strategy names to new names
-    // minimal → fast, context_rich → balanced, verified → verified
-    const strategyMap: Record<string, Strategy> = {
-      minimal: "fast",
-      context_rich: "balanced",
-      verified: "verified",
-      fast: "fast",
-      balanced: "balanced",
-    }
-
-    if (parsed.activeStrategy && typeof parsed.activeStrategy === "object") {
-      for (const type of ["coding", "reasoning", "debug"] as TaskType[]) {
-        const oldName = parsed.activeStrategy[type] as string
-        if (oldName && strategyMap[oldName]) {
-          parsed.activeStrategy[type] = strategyMap[oldName]
+        const entry = sessionCtx.get(input.sessionID)
+        // Touch entry on access to extend TTL
+        if (entry) {
+          entry.ts = Date.now()
         }
+       const ctx = entry?.ctx || {}
+      const exitCode = output.metadata?.error ? 1 : 0
+
+      const result: ToolResult = {
+        toolName: input.tool,
+        exitCode,
+        output: output.output || "",
+        metadata: output.metadata as Record<string, unknown> | undefined,
       }
-    }
 
-    // Ensure all required fields exist
-    const migrated: PluginState = {
-      ...DEFAULT_STATE,
-      ...parsed,
-      activeStrategy: {
-        ...DEFAULT_STATE.activeStrategy,
-        ...parsed.activeStrategy,
-      },
-      metrics: {
-        ...DEFAULT_STATE.metrics,
-        ...parsed.metrics,
-      },
-      errorWeights: {
-        ...DEFAULT_STATE.errorWeights,
-        ...parsed.errorWeights,
-      },
-      contextBudgetTokens: {
-        ...DEFAULT_STATE.contextBudgetTokens,
-        ...parsed.contextBudgetTokens,
-      },
-      overrides: {
-        ...DEFAULT_STATE.overrides,
-        ...parsed.overrides,
-      },
-      modelPricing: {
-        ...DEFAULT_STATE.modelPricing,
-        ...parsed.modelPricing,
-      },
-    }
+    if (debugMode) console.log('[observer] ctx', ctx)
+    const rowId = observe(db, ctx, result)
+   if (debugMode) console.log(`[observer] rowId=${rowId}`)
 
-    return migrated
-  } catch (error) {
-    return { ...DEFAULT_STATE }
+   // Mark tool as dirty in cache so it gets refreshed on next interval
+   toolStatsCache.invalidate(input.tool)
+
+   // Track per-session tool stats for compaction enrichment (Phase 3)
+   if (entry) {
+     if (!entry.toolStats) entry.toolStats = new Map()
+     const stat = entry.toolStats.get(input.tool) || { total: 0, failed: 0 }
+     stat.total++
+     if (exitCode !== 0) stat.failed++
+     entry.toolStats.set(input.tool, stat)
+   }
+
+        // Store record ID in session context for potential abandonment penalty
+        if (entry) {
+          if (rowId != null) {
+            entry.lastRecordId = rowId
+          } else {
+            // Record insertion failed – log for debugging (gated by debugMode to avoid spam)
+            if (debugMode) console.warn('[adaptive] observe failed to insert record for session', input.sessionID.slice(0, 8))
+          }
+        }
+
+      // If confidence provided in metadata, update the existing record's confidence
+      if (entry?.lastRecordId && output.metadata?.confidence !== undefined) {
+        const newConf = Math.min(1, Math.max(0, Number(output.metadata.confidence)))
+        db.run("UPDATE telemetry_v2 SET confidence = ? WHERE id = ?", newConf, entry.lastRecordId)
+        log(`[confidence] updated record ${entry.lastRecordId} to ${newConf}`)
+      }
+
+      if (debugMode) {
+        log(`[observer] ${input.tool} exit=${exitCode} session=${input.sessionID.slice(0, 8)}…`)
+      }
+    },
+
+    // Gated hooks — require experimentalActive: true in config
+    ...(experimentalActive ? {
+      // Enrich tool descriptions with reliability stats from cache
+      "tool.definition"(input: { toolID: string }, output: { description: string; parameters?: any; jsonSchema?: any }): Promise<void> {
+        const stats = toolStatsCache.get(input.toolID)
+        if (stats && stats.totalCalls >= 5) {
+          metrics.cacheHits++
+          const pct = Math.round(stats.successRate * 100)
+          output.description = `${output.description} [${pct}% success, ${stats.totalCalls} calls]`
+          return Promise.resolve()
+        }
+        // Cold start: query DB directly (first call only)
+        if (!stats) {
+          metrics.cacheMisses++
+          const dbStats = queryToolStats(db, input.toolID)
+          if (dbStats && dbStats.totalCalls >= 5) {
+            toolStatsCache.set(input.toolID, { successRate: dbStats.successRate, totalCalls: dbStats.totalCalls })
+            const pct = Math.round(dbStats.successRate * 100)
+            output.description = `${output.description} [${pct}% success, ${dbStats.totalCalls} calls]`
+            return Promise.resolve()
+          }
+          // Populate cache even with zero calls to avoid repeated cold starts
+          toolStatsCache.set(input.toolID, {
+            successRate: dbStats?.successRate ?? 0,
+            totalCalls: dbStats?.totalCalls ?? 0,
+          })
+        }
+        return Promise.resolve()
+      },
+
+      // Cross-session hints: inject failing tool patterns into new session system prompt
+      "experimental.chat.system.transform"(input: { sessionID?: string; model: any }, output: { system: string[] }): Promise<void> {
+        if (!input.sessionID) return Promise.resolve()
+        const entry = sessionCtx.get(input.sessionID)
+        if (!entry || entry.hintsDelivered) return Promise.resolve()
+
+        const hints = queryFailingTools(db, 3)
+        if (hints.length > 0) {
+          entry.hintsDelivered = true
+          metrics.hintsDelivered++
+          const note = "Note: previous sessions had recurring failures—" +
+            hints.map(h =>
+              `${h.toolName} (${h.failedCalls} fails, ${Math.round((h.totalCalls - h.failedCalls) / h.totalCalls * 100)}% success)`
+            ).join("; ")
+          output.system.push(note)
+          if (debugMode) log(`[hints] injected for session ${input.sessionID.slice(0, 8)}…: ${note}`)
+        }
+        return Promise.resolve()
+      },
+
+      // Session compaction enrichment: preserve tool reliability awareness across compaction
+      async "experimental.session.compacting"(input: { sessionID: string }, output: { context: string[]; prompt?: string }): Promise<void> {
+        const entry = sessionCtx.get(input.sessionID)
+        if (!entry?.toolStats || entry.toolStats.size === 0) return
+
+        // Find tools with >30% failure rate and at least 3 calls (meaningful signal)
+        const failing: string[] = []
+        for (const [toolName, stat] of entry.toolStats) {
+          if (stat.total >= 3 && stat.failed / stat.total > 0.3) {
+            failing.push(`${toolName} (${stat.failed}/${stat.total} fails)`)
+          }
+        }
+
+        if (failing.length > 0) {
+          metrics.compactionContextsInjected++
+          output.context.push(
+            "⚠️ Tool failures this session: " + failing.join("; ")
+          )
+          if (debugMode) log(`[compaction] context for ${input.sessionID.slice(0, 8)}…: ${failing.join("; ")}`)
+        }
+      },
+    } : {}),
   }
-}
-
-async function saveState(filePath: string, state: PluginState) {
-  state.lastAdaptation = Date.now()
-  const dir = path.dirname(filePath)
-  await fs.mkdir(dir, { recursive: true })
-  await fs.writeFile(filePath, JSON.stringify(state, null, 2))
 }

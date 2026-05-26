@@ -7,8 +7,5 @@
     "github-triage": false,
     "github-pr-search": false,
   },
-  "plugin": [
-    "list",
-    "ls"
-  ],
+  "plugin": [["../packages/plugin-adaptive", { "experimentalActive": true, "debug": false }]],
 }

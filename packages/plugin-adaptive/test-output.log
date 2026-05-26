@@ -1,0 +1,50 @@
+bun test v1.3.14 (0d9b296a)
+
+src/adaptive.test.ts:
+172 | 
+173 |   // Step 1: Get top groups by total count
+174 |   const groups = db.query(
+175 |     `SELECT ${groupBy} as grp, COUNT(*) as cnt FROM telemetry_v2 WHERE ${groupBy} IS NOT NULL GROUP BY grp ORDER BY cnt DESC LIMIT ?`,
+176 |     [limit]
+177 |   ).all() as Array<{ grp: string; cnt: number }>
+          ^
+SQLiteError: datatype mismatch
+      errno: 20,
+ byteOffset: -1,
+       code: "SQLITE_MISMATCH"
+
+      at queryTrends (/home/stormrage/opencode/packages/plugin-adaptive/src/db.ts:177:5)
+      at execute (/home/stormrage/opencode/packages/plugin-adaptive/src/adaptive.ts:183:38)
+      at <anonymous> (/home/stormrage/opencode/packages/plugin-adaptive/src/adaptive.test.ts:144:66)
+(fail) AdaptivePlugin v2 > adaptive_trends returns empty with no data [33.37ms]
+172 | 
+173 |   // Step 1: Get top groups by total count
+174 |   const groups = db.query(
+175 |     `SELECT ${groupBy} as grp, COUNT(*) as cnt FROM telemetry_v2 WHERE ${groupBy} IS NOT NULL GROUP BY grp ORDER BY cnt DESC LIMIT ?`,
+176 |     [limit]
+177 |   ).all() as Array<{ grp: string; cnt: number }>
+          ^
+SQLiteError: datatype mismatch
+      errno: 20,
+ byteOffset: -1,
+       code: "SQLITE_MISMATCH"
+
+      at queryTrends (/home/stormrage/opencode/packages/plugin-adaptive/src/db.ts:177:5)
+      at execute (/home/stormrage/opencode/packages/plugin-adaptive/src/adaptive.ts:183:38)
+      at <anonymous> (/home/stormrage/opencode/packages/plugin-adaptive/src/adaptive.test.ts:165:66)
+(fail) AdaptivePlugin v2 > adaptive_trends computes trends correctly [2.17ms]
+233 |        model: { providerID: "nvidia", modelID: "test" },
+234 |      }, {} as any)
+235 | 
+236 |      // Check that the prior record's confidence decreased
+237 |      const after = db.query("SELECT confidence FROM telemetry_v2 WHERE agent = ? ORDER BY id DESC LIMIT 1", ["oracle"]).get() as { confidence: number }
+238 |      expect(after.confidence).toBeCloseTo(before.confidence - 0.10, 5)
+                  ^
+TypeError: null is not an object (evaluating 'after.confidence')
+      at <anonymous> (/home/stormrage/opencode/packages/plugin-adaptive/src/adaptive.test.ts:238:13)
+(fail) AdaptivePlugin v2 > abandonment detection reduces confidence of prior record [1.50ms]
+
+ 11 pass
+ 3 fail
+ 16 expect() calls
+Ran 14 tests across 1 file. [929.00ms]

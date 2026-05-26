@@ -19,14 +19,14 @@ export type Event =
   | EventMessagePartDelta
   | EventPermissionAsked
   | EventPermissionReplied
+  | EventSessionStatus
+  | EventSessionIdle
   | EventSessionDiff
   | EventSessionError
   | EventQuestionAsked
   | EventQuestionReplied
   | EventQuestionRejected
   | EventTodoUpdated
-  | EventSessionStatus
-  | EventSessionIdle
   | EventMcpToolsChanged
   | EventMcpBrowserOpenFailed
   | EventMcpStatusChanged
@@ -190,6 +190,28 @@ export type PermissionRequest = {
   }
 }
 
+export type SessionStatus =
+  | {
+      type: "idle"
+    }
+  | {
+      type: "retry"
+      attempt: number
+      message: string
+      action?: {
+        reason: string
+        provider: string
+        title: string
+        message: string
+        label: string
+        link?: string
+      }
+      next: number
+    }
+  | {
+      type: "busy"
+    }
+
 export type SnapshotFileDiff = {
   file?: string
   patch?: string
@@ -330,28 +352,6 @@ export type Todo = {
    */
   priority: string
 }
-
-export type SessionStatus =
-  | {
-      type: "idle"
-    }
-  | {
-      type: "retry"
-      attempt: number
-      message: string
-      action?: {
-        reason: string
-        provider: string
-        title: string
-        message: string
-        label: string
-        link?: string
-      }
-      next: number
-    }
-  | {
-      type: "busy"
-    }
 
 export type McpStatusConnected = {
   status: "connected"
@@ -855,14 +855,14 @@ export type GlobalEvent = {
     | EventMessagePartDelta
     | EventPermissionAsked
     | EventPermissionReplied
+    | EventSessionStatus
+    | EventSessionIdle
     | EventSessionDiff
     | EventSessionError
     | EventQuestionAsked
     | EventQuestionReplied
     | EventQuestionRejected
     | EventTodoUpdated
-    | EventSessionStatus
-    | EventSessionIdle
     | EventMcpToolsChanged
     | EventMcpBrowserOpenFailed
     | EventMcpStatusChanged
@@ -2593,6 +2593,23 @@ export type EventPermissionReplied = {
   }
 }
 
+export type EventSessionStatus = {
+  id: string
+  type: "session.status"
+  properties: {
+    sessionID: string
+    status: SessionStatus
+  }
+}
+
+export type EventSessionIdle = {
+  id: string
+  type: "session.idle"
+  properties: {
+    sessionID: string
+  }
+}
+
 export type EventSessionDiff = {
   id: string
   type: "session.diff"
@@ -2642,23 +2659,6 @@ export type EventTodoUpdated = {
   properties: {
     sessionID: string
     todos: Array<Todo>
-  }
-}
-
-export type EventSessionStatus = {
-  id: string
-  type: "session.status"
-  properties: {
-    sessionID: string
-    status: SessionStatus
-  }
-}
-
-export type EventSessionIdle = {
-  id: string
-  type: "session.idle"
-  properties: {
-    sessionID: string
   }
 }
 

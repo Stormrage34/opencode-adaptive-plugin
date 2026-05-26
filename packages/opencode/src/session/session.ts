@@ -40,6 +40,7 @@ import { Global } from "@opencode-ai/core/global"
 import { Effect, Layer, Option, Context, Schema, Types } from "effect"
 import { NonNegativeInt, optionalOmitUndefined } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { SessionRunState } from "@/session/run-state"
 
 const log = Log.create({ service: "session" })
 
@@ -510,7 +511,7 @@ const db = <T>(fn: (d: Parameters<typeof Database.use>[0] extends (trx: infer D)
 export const layer: Layer.Layer<
   Service,
   never,
-  BackgroundJob.Service | Bus.Service | Storage.Service | SyncEvent.Service | RuntimeFlags.Service
+  BackgroundJob.Service | Bus.Service | Storage.Service | SyncEvent.Service | RuntimeFlags.Service | SessionRunState.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -519,6 +520,7 @@ export const layer: Layer.Layer<
     const storage = yield* Storage.Service
     const sync = yield* SyncEvent.Service
     const flags = yield* RuntimeFlags.Service
+    const state = yield* SessionRunState.Service
 
     const createNext = Effect.fn("Session.createNext")(function* (input: {
       id?: SessionID
@@ -602,7 +604,7 @@ export const layer: Layer.Layer<
           Effect.catchCause(() => Effect.succeed(false)),
         )
 
-        if (hasInstance) yield* cancelBackgroundJobs(background, sessionID)
+        if (hasInstance) yield* state.cancel(sessionID)
         const kids = yield* children(sessionID)
         for (const child of kids) {
           yield* remove(child.id)
@@ -869,24 +871,9 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Storage.defaultLayer),
   Layer.provide(SyncEvent.defaultLayer),
   Layer.provide(RuntimeFlags.defaultLayer),
+  Layer.provide(SessionRunState.defaultLayer),
 )
 
-const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function* (
-  background: BackgroundJob.Interface,
-  sessionID: SessionID,
-) {
-  const jobs = yield* background.list()
-  yield* Effect.forEach(
-    jobs.filter((job) => {
-      if (job.status !== "running") return false
-      if (job.id === sessionID) return true
-      if (job.metadata?.sessionId === sessionID) return true
-      return job.metadata?.parentSessionId === sessionID
-    }),
-    (job) => background.cancel(job.id),
-    { concurrency: 5, discard: true },
-  )
-})
 
 function* listByProject(
   input: ListInput & {

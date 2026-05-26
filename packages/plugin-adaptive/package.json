@@ -13,7 +13,8 @@
     "src"
   ],
   "scripts": {
-    "typecheck": "tsgo --noEmit"
+    "typecheck": "tsgo --noEmit",
+    "test": "bun test src/adaptive.test.ts"
   },
   "dependencies": {
     "@opencode-ai/plugin": "workspace:*"
