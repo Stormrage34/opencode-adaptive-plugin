@@ -1,15 +1,33 @@
 # Adaptive Plugin — Summary
 
+## Installation
+
+```sh
+# From the repository root
+bun install                     # install dependencies
+# Register the plugin in OpenCode (add to opencode.jsonc)
+opencode plugin add ./packages/plugin-adaptive   # or edit opencode.jsonc manually
+```
+
+
 ## What It Does
 
 The Adaptive Plugin is a **passive observer** for OpenCode that automatically harvests implicit signals from tool executions and stores them in a local SQLite database. It provides:
 
 1. **Automatic Confidence Scoring** — Computes base confidence from exit code and duration, then refines via output validation
 2. **Trend Analysis** — Detects improving/declining confidence patterns by agent, tool, or model
-3. **Abandonment Detection** — Penalizes prior session confidence when user switches contexts
+3. **Abandonment Detection** — Penalizes prior session confidence when user switches contexts. The abandoned session is retained for enrichment (e.g., compaction hints) and automatically purged after a configurable TTL (default 30 minutes).
 4. **Deduplication** — Sliding window (5s) prevents duplicate recordings of rapid tool calls
 5. **Telemetry Export** — JSON/CSV export, status readout, and reset capability
 6. **Internal Metrics** — Counters for ops visibility (`adaptive_metrics` tool)
+
+## Configuration Options
+
+- `dbPath` (string) – Path to the SQLite DB file (default: `.opencode_telemetry.db` in the working directory).
+- `debug` (boolean) – Enable verbose internal logging.
+- `experimentalActive` (boolean) – Enable experimental enrichment hooks.
+- `dedupWindow` (number) – Sliding‑window deduplication period in ms (default 5000).
+- `abandonmentTTL` (number) – Time‑to‑live for abandoned sessions before they are purged (default 30 minutes).
 7. **Tool Enrichment** (experimental) — Appends reliability stats to tool descriptions (`tool.definition` hook)
 8. **Cross-Session Hints** (experimental) — Injects failing tool patterns from past sessions into new session prompts
 9. **Session Compaction Context** (experimental) — Preserves tool failure awareness across conversation compaction
@@ -19,6 +37,80 @@ The Adaptive Plugin is a **passive observer** for OpenCode that automatically ha
 **Scope:** This plugin provides telemetry, trend analysis, confidence scoring, and experimental enrichment hooks. Advisory routing & model recommendations are deferred to v2.2.
 
 ---
+
+## Architecture
+
+```text
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         OpenCode Core (Host)                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Hooks Registered by AdaptivePlugin:                                   │
+│    • tool.execute.after  ←─ captures every tool execution             │
+│    • chat.message        ←─ session context & abandonment detection   │
+│    • flush               ←─ cleanup on shutdown                       │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       AdaptivePlugin (Entry)                           │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ State (per plugin instance):                                     │  │
+│  │   • db: Database (SQLite WAL)                                    │  │
+│  │   • sessionCtx: Map<sessionID, {ctx, ts, lastRecordId}>         │  │
+│  │   • recentOps: RecentOpsCache (5s sliding window)               │  │
+│  │   • duplicateWarningTimestamps: Map<key, ts> (rate-limit)       │  │
+│  │   • timers: TTL cleanup, dup cleanup, recentOps cleanup        │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                     ┌──────────────┴──────────────┐
+                     ▼                             ▼
+        ┌─────────────────────┐   ┌─────────────────────────┐
+        │   chat.message      │   │  tool.execute.after    │
+        │   (Session Context) │   │  (Auto-Observer)       │
+        └─────────────────────┘   └─────────────────────────┘
+                     │                             │
+                     │ stores/updates              │ computes confidence
+                     ▼                             ▼
+        ┌─────────────────────┐   ┌─────────────────────────┐
+        │  sessionCtx Map      │   │   observe()             │
+        │  + abandonment      │   │   • computeBaseConf()   │
+        │    penalty update   │   │   • writeRecord()       │
+        └─────────────────────┘   │   • queueMicrotask()    │
+                                   │     (validation update) │
+                                   └─────────────────────────┘
+                                            │
+                                            ▼
+                                   ┌─────────────────────┐
+                                   │   writeRecord()     │
+                                   │   (db.ts)           │
+                                   └─────────────────────┘
+                                            │
+                                            ▼
+                                   ┌─────────────────────┐
+                                   │   SQLite            │
+                                   │   telemetry_v2      │
+                                   └─────────────────────┘
+                                            │
+        ┌───────────────────────────────────┼─────────────────────────────┐
+        │                                   │                             │
+        ▼                                   ▼                             ▼
+┌───────────────────┐           ┌───────────────────┐       ┌──────────────────┐
+│  Indexes:         │           │  Queries:         │       │  Tools:          │
+│  • idx_trends_agg │           │  • queryStats()   │       │  • adaptive_     │
+│    (agent, tool,  │           │  • queryRecent()  │       │    record        │
+│    confidence,    │           │  • queryTrends()  │       │  • adaptive_     │
+│    timestamp)     │           │                   │       │    status        │
+│  • idx_telemetry_ │           └───────────────────┘       │  • adaptive_     │
+│    v2_ts          │                                        │    export        │
+│  • idx_telemetry_ │                                        │  • adaptive_     │
+│    v2_task        │                                        │    reset         │
+└───────────────────┘                                        │  • adaptive_     │
+                                                              │    trends        │
+                                                              │  • adaptive_     │
+                                                              │    metrics       │
+                                                              └──────────────────┘
+```
 
 ## Advantages
 

@@ -20,28 +20,11 @@ export const metrics = {
   abandonmentPenalties: 0,
   dbErrors: 0,
   validationQueueDrops: 0,
+  iterationGuardTriggers: 0,
+  iterationPenalties: 0,
 } as const;
 
-export function resetMetrics() {
-  metrics.totalInserted = 0;
-  metrics.duplicateAttempts = 0;
-  metrics.duplicateWarnings = 0;
-  metrics.ttlCleanupRuns = 0;
-  metrics.ttlRecordsDeleted = 0;
-  metrics.queryStatsCalls = 0;
-  metrics.queryRecentCalls = 0;
-  metrics.queryTrendsCalls = 0;
-  metrics.queryToolStatsCalls = 0;
-  metrics.cacheHits = 0;
-  metrics.cacheMisses = 0;
-  metrics.cacheRefreshRuns = 0;
-  metrics.cacheRefreshed = 0;
-  metrics.hintsDelivered = 0;
-  metrics.compactionContextsInjected = 0;
-  metrics.abandonmentPenalties = 0;
-  metrics.dbErrors = 0;
-  metrics.validationQueueDrops = 0;
-}
+
 
 
 export function resetMetrics() {
@@ -63,4 +46,6 @@ export function resetMetrics() {
   metrics.compactionContextsInjected = 0
   metrics.abandonmentPenalties = 0
   metrics.dbErrors = 0
+  metrics.iterationGuardTriggers = 0
+  metrics.iterationPenalties = 0
 }

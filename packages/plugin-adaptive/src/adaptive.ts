@@ -20,10 +20,16 @@ const log = (...args: any[]) => {
 
 // Session TTL constants
 const SESSION_TTL = 2 * 60 * 60 * 1000 // 2 hours
+const DEFAULT_ABANDONMENT_TTL = 30 * 60 * 1000 // 30 minutes default for abandoned sessions
 const CLEANUP_BURST_LIMIT = 500
+// Default maximum number of chat.message iterations per session before halting further processing
+const DEFAULT_MAX_ITERATIONS = 10
 
 // Per-session state for Phase 2 (hints) and Phase 3 (compaction)
 interface SessionState {
+  // Number of chat.message calls seen for this session (iteration guard)
+  iterationCount?: number
+  abandonedAt?: number
   ctx: ObserverContext
   ts: number
   lastRecordId?: number
@@ -32,7 +38,7 @@ interface SessionState {
 }
 
 // Cleanup stale sessions; returns number of entries deleted
-export function cleanupSessions(sessionCtx: Map<string, SessionState>): number {
+export function cleanupSessions(sessionCtx: Map<string, SessionState>, abandonmentTTL: number): number {
   const now = Date.now()
   let deleted = 0
   // Copy keys to avoid iterator invalidation from concurrent chat.message writes
@@ -40,11 +46,16 @@ export function cleanupSessions(sessionCtx: Map<string, SessionState>): number {
   for (const id of ids) {
     const entry = sessionCtx.get(id)
     if (!entry) continue
-    if (now - entry.ts > SESSION_TTL) {
-      sessionCtx.delete(id)
-      deleted++
-      if (deleted >= CLEANUP_BURST_LIMIT) break
-    }
+if (now - entry.ts > SESSION_TTL) {
+          sessionCtx.delete(id)
+          deleted++
+          if (deleted >= CLEANUP_BURST_LIMIT) break
+        } else if (entry.abandonedAt && now - entry.abandonedAt > abandonmentTTL) {
+          // Abandoned session TTL exceeded – clean up
+          sessionCtx.delete(id)
+          deleted++
+          if (deleted >= CLEANUP_BURST_LIMIT) break
+        }
   }
   return deleted
 }
@@ -52,11 +63,13 @@ export function cleanupSessions(sessionCtx: Map<string, SessionState>): number {
 // Plugin
 
 export const AdaptivePlugin: Plugin = async (ctx, options) => {
-  const config = options as { dbPath?: string; debug?: boolean; experimentalActive?: boolean; dedupWindow?: number } | undefined
+  const config = options as { dbPath?: string; debug?: boolean; experimentalActive?: boolean; dedupWindow?: number; abandonmentTTL?: number; maxIterations?: number } | undefined
 
   const dbPath = config?.dbPath || path.join(ctx.directory, ".opencode_telemetry.db")
   debugMode = config?.debug || false
   const experimentalActive = config?.experimentalActive || false
+  const abandonmentTTL = config?.abandonmentTTL ?? DEFAULT_ABANDONMENT_TTL
+  const maxIterations = config?.maxIterations ?? DEFAULT_MAX_ITERATIONS
 
   // Initialize SQLite
   const db = createTelemetryDb(dbPath)
@@ -73,7 +86,7 @@ export const AdaptivePlugin: Plugin = async (ctx, options) => {
   const TTL = setInterval(async () => {
     if (isCleaning) return
     isCleaning = true
-    const deleted = cleanupSessions(sessionCtx)
+    const deleted = cleanupSessions(sessionCtx, abandonmentTTL)
     metrics.ttlCleanupRuns++
     metrics.ttlRecordsDeleted += deleted
     isCleaning = false
@@ -321,9 +334,32 @@ let result: TrendResult[]
 
     // Passive context cache — stores session metadata for downstream observer
      async "chat.message"(input, _output) {
-       if (!input.sessionID) return
+        if (!input.sessionID) return
 
-       // Implicit abandonment detection: if another recent session exists, penalize it
+        // Iteration guard – limit number of chat.message cycles per session
+        let entry = sessionCtx.get(input.sessionID)
+        if (entry) {
+          entry.iterationCount = (entry.iterationCount ?? 0) + 1
+          if (entry.iterationCount > maxIterations) {
+            if (debugMode) log(`[iteration guard] session ${input.sessionID.slice(0, 8)} exceeded max ${maxIterations}`)
+            // Apply confidence penalty if possible
+            if (entry.lastRecordId != null) {
+              const current = db.query("SELECT confidence FROM telemetry_v2 WHERE id = ?").get(entry.lastRecordId) as { confidence: number } | null
+              if (current && current.confidence > 0.5) {
+                const penalty = 0.15
+                db.run("UPDATE telemetry_v2 SET confidence = MAX(0, confidence - ?) WHERE id = ?", penalty, entry.lastRecordId)
+                metrics.iterationPenalties++
+                if (debugMode) log(`[iteration guard] penalized session ${input.sessionID.slice(0, 8)} confidence -${penalty}`)
+              }
+            }
+            metrics.iterationGuardTriggers++
+            // Mark as abandoned for cleanup
+            entry.abandonedAt = Date.now()
+            return
+          }
+        }
+
+        // Implicit abandonment detection: if another recent session exists, penalize it
       const ABANDONMENT_WINDOW_MS = 5 * 60 * 1000 // 5 minutes
       const ABANDONMENT_PENALTY = 0.10
       const now = Date.now()
@@ -351,22 +387,25 @@ let result: TrendResult[]
           )
           metrics.abandonmentPenalties++
           log(`[abandonment] penalized session ${candidate.id.slice(0, 8)}… confidence -${ABANDONMENT_PENALTY}`)
+          // Mark this session as abandoned for later TTL cleanup
+          candidate.entry.abandonedAt = now
         }
-        sessionCtx.delete(candidate.id)
+          // Preserve session for later compaction – do not delete here; will be cleaned by abandonment TTL
       }
 
       // Extract model info
       const model = input.model?.modelID || undefined
 
        // Store session context for tool.execute.after correlation
-        sessionCtx.set(input.sessionID, {
-          ctx: {
-            model,
-            agent: input.agent,
-          },
-          ts: Date.now(),
-          toolStats: new Map(),
-        })
+sessionCtx.set(input.sessionID, {
+           ctx: {
+             model,
+             agent: input.agent,
+           },
+            ts: Date.now(),
+           toolStats: new Map(),
+           iterationCount: entry?.iterationCount ?? 1,
+         })
        log(`[chat.message] sessionCtx[${input.sessionID.slice(0, 8)}…] model=${model ?? "?"} agent=${input.agent ?? "?"}`)
     },
 

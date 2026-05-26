@@ -7,5 +7,14 @@
     "github-triage": false,
     "github-pr-search": false,
   },
-  "plugin": [["../packages/plugin-adaptive", { "experimentalActive": true, "debug": false }]],
+  "plugin": [
+    [
+      "../packages/plugin-adaptive",
+      {
+        "experimentalActive": true,
+        "debug": false
+      }
+    ],
+    "list"
+  ],
 }
