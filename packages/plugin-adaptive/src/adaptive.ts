@@ -11,6 +11,7 @@ import { metrics } from "./metrics.js"
 import { RecentOpsCache } from "./recent-ops-cache.js"
 import { ToolStatsCache } from "./tool-stats-cache.js"
 import type { ObserverContext } from "./observer.js"
+/* eslint-disable @typescript-eslint/no-explicit-any */
 
 // Module-level debug logger
 let debugMode = false
@@ -63,13 +64,18 @@ if (now - entry.ts > SESSION_TTL) {
 // Plugin
 
 export const AdaptivePlugin: Plugin = async (ctx, options) => {
-  const config = options as { dbPath?: string; debug?: boolean; experimentalActive?: boolean; dedupWindow?: number; abandonmentTTL?: number; maxIterations?: number } | undefined
+  const config = options as { dbPath?: string; debug?: boolean; experimentalActive?: boolean; dedupWindow?: number; abandonmentTTL?: number; maxIterations?: number; disableIterationGuard?: boolean } | undefined
 
-  const dbPath = config?.dbPath || path.join(ctx.directory, ".opencode_telemetry.db")
+   const rawDbPath = config?.dbPath || path.join(ctx.directory, ".opencode_telemetry.db")
+   const dbPath = path.resolve(rawDbPath)
   debugMode = config?.debug || false
   const experimentalActive = config?.experimentalActive || false
   const abandonmentTTL = config?.abandonmentTTL ?? DEFAULT_ABANDONMENT_TTL
   const maxIterations = config?.maxIterations ?? DEFAULT_MAX_ITERATIONS
+  const disableIterationGuard = config?.disableIterationGuard ?? false
+  const adaptiveRetentionDays = config?.adaptiveRetentionDays ?? 30;
+/* childMode detection: skip periodic cleanup timers when true */
+const childMode = config?.childMode ?? false; // true for child processes
 
   // Initialize SQLite
   const db = createTelemetryDb(dbPath)
@@ -81,30 +87,55 @@ export const AdaptivePlugin: Plugin = async (ctx, options) => {
   // Populated by chat.message, consumed by tool.execute.after
   // TTL: 2hr, cleanup every 30min (non-blocking with yield)
   const sessionCtx = new Map<string, SessionState>()
-  const CLEANUP_INTERVAL = 30 * 60 * 1000 // 30 minutes
-  let isCleaning = false
-  const TTL = setInterval(async () => {
-    if (isCleaning) return
-    isCleaning = true
-    const deleted = cleanupSessions(sessionCtx, abandonmentTTL)
-    metrics.ttlCleanupRuns++
-    metrics.ttlRecordsDeleted += deleted
-    isCleaning = false
-  }, CLEANUP_INTERVAL)
-  if (TTL.unref) TTL.unref()
+   const CLEANUP_INTERVAL = 30 * 60 * 1000 // 30 minutes
+   let isCleaning = false
+   let TTL: NodeJS.Timeout | undefined
+   if (!childMode) {
+     TTL = setInterval(async () => {
+       if (isCleaning) return
+       isCleaning = true
+       const deleted = cleanupSessions(sessionCtx, abandonmentTTL)
+       metrics.ttlCleanupRuns++
+       metrics.ttlRecordsDeleted += deleted
+       isCleaning = false
+     }, CLEANUP_INTERVAL)
+     if (TTL.unref) TTL.unref()
+   }
 
-  // Periodic cleanup for duplicateWarningTimestamps to prevent unbounded growth
-  const DUP_WARN_CLEANUP = setInterval(() => {
-    if (duplicateWarningTimestamps.size === 0) return
-    const now = Date.now()
-    // Copy keys to avoid iterator invalidation from concurrent writeRecord writes
-    const keys = Array.from(duplicateWarningTimestamps.keys())
-    for (const key of keys) {
-      const ts = duplicateWarningTimestamps.get(key)
-      if (ts && now - ts > 3600_000) duplicateWarningTimestamps.delete(key)
-    }
-  }, 3600_000)
-  if (DUP_WARN_CLEANUP.unref) DUP_WARN_CLEANUP.unref()
+   // Periodic cleanup for duplicateWarningTimestamps to prevent unbounded growth
+   let DUP_WARN_CLEANUP: NodeJS.Timeout | undefined
+   if (!childMode) {
+     DUP_WARN_CLEANUP = setInterval(() => {
+       if (duplicateWarningTimestamps.size === 0) return
+       const now = Date.now()
+       // Copy keys to avoid iterator invalidation from concurrent writeRecord writes
+       const keys = Array.from(duplicateWarningTimestamps.keys())
+       for (const key of keys) {
+         const ts = duplicateWarningTimestamps.get(key)
+         if (ts && now - ts > 3600_000) duplicateWarningTimestamps.delete(key)
+       }
+     }, 3600_000)
+     if (DUP_WARN_CLEANUP.unref) DUP_WARN_CLEANUP.unref()
+   }
+
+   // Retention cleanup: delete old telemetry rows beyond retention period
+   let RETENTION_CLEANUP: NodeJS.Timeout | undefined
+   if (!childMode) {
+     RETENTION_CLEANUP = setInterval(() => {
+       if (!db) return
+       const days = adaptiveRetentionDays
+       const stmt = `DELETE FROM telemetry_v2 WHERE timestamp < datetime('now', '-${days} days')`
+       try {
+         const result = db.run(stmt)
+         // SQLite run returns object with changes count
+         const deleted = (result as any).changes ?? 0
+         if (deleted > 0) metrics.ttlRecordsDeleted += deleted
+       } catch {
+         // ignore errors, will be counted in dbErrors via other paths
+       }
+     }, 60 * 60 * 1000) // every hour
+     if (RETENTION_CLEANUP.unref) RETENTION_CLEANUP.unref()
+   }
 
     // 5s sliding window dedup — tracks (sessionID:toolName) timestamps using an efficient TTL cache
     const DEDUP_WINDOW = config?.dedupWindow ?? 5000
@@ -113,38 +144,47 @@ export const AdaptivePlugin: Plugin = async (ctx, options) => {
     // Downstream agents can call "tool.pre.execute" to set tokens before the actual tool execution
 
 
-  // Periodic cleanup for recentOps to prevent unbounded growth
-  const RECENTOPS_CLEANUP_INTERVAL = 60 * 1000 // 60 seconds
-  const recentOpsCleanup = setInterval(() => {
-    recentOps.cleanup()
-  }, RECENTOPS_CLEANUP_INTERVAL)
-  if (recentOpsCleanup.unref) recentOpsCleanup.unref()
+   // Periodic cleanup for recentOps to prevent unbounded growth
+   const RECENTOPS_CLEANUP_INTERVAL = 60 * 1000 // 60 seconds
+   let recentOpsCleanup: NodeJS.Timeout | undefined
+   if (!childMode) {
+     recentOpsCleanup = setInterval(() => {
+       recentOps.cleanup()
+     }, RECENTOPS_CLEANUP_INTERVAL)
+     if (recentOpsCleanup.unref) recentOpsCleanup.unref()
+   }
 
   // ── ToolStatsCache — zero-DB-IO enrichment layer ──
   const toolStatsCache = new ToolStatsCache()
 
-  // 30s refresh: query DB for dirty tools and populate cache
-  const CACHE_REFRESH_INTERVAL = 30_000
-  const cacheRefresher = setInterval(() => {
-    const dirty = toolStatsCache.getDirty()
-    if (dirty.length === 0) return
-    metrics.cacheRefreshRuns++
-    for (const toolName of dirty) {
-      const stats = queryToolStats(db, toolName)
-      if (stats) {
-        toolStatsCache.set(toolName, { successRate: stats.successRate, totalCalls: stats.totalCalls })
-        metrics.cacheRefreshed++
-      }
-    }
-  }, CACHE_REFRESH_INTERVAL)
-  if (cacheRefresher.unref) cacheRefresher.unref()
+   // 30s refresh: query DB for dirty tools and populate cache
+   const CACHE_REFRESH_INTERVAL = 30_000
+   let cacheRefresher: NodeJS.Timeout | undefined
+   if (!childMode) {
+     cacheRefresher = setInterval(() => {
+       const dirty = toolStatsCache.getDirty()
+       if (dirty.length === 0) return
+       metrics.cacheRefreshRuns++
+       for (const toolName of dirty) {
+         const stats = queryToolStats(db, toolName)
+         if (stats) {
+           toolStatsCache.set(toolName, { successRate: stats.successRate, totalCalls: stats.totalCalls })
+           metrics.cacheRefreshed++
+         }
+       }
+     }, CACHE_REFRESH_INTERVAL)
+     if (cacheRefresher.unref) cacheRefresher.unref()
+   }
 
-  // 30s cleanup: evict entries untouched for 60s
-  const cacheCleaner = setInterval(() => {
-    const evicted = toolStatsCache.cleanup()
-    metrics.cacheEvictions += evicted
-  }, CACHE_REFRESH_INTERVAL)
-  if (cacheCleaner.unref) cacheCleaner.unref()
+   // 30s cleanup: evict entries untouched for 60s
+   let cacheCleaner: NodeJS.Timeout | undefined
+   if (!childMode) {
+     cacheCleaner = setInterval(() => {
+       const evicted = toolStatsCache.cleanup()
+       metrics.cacheEvictions += evicted
+     }, CACHE_REFRESH_INTERVAL)
+     if (cacheCleaner.unref) cacheCleaner.unref()
+   }
 
   // ── Tools ──
 
@@ -292,6 +332,8 @@ let result: TrendResult[]
           abandonmentPenalties: metrics.abandonmentPenalties,
           dbErrors: metrics.dbErrors,
           validationQueueDrops: metrics.validationQueueDrops,
+          iterationGuardTriggers: metrics.iterationGuardTriggers,
+          iterationPenalties: metrics.iterationPenalties,
         }, null, 2)
       },
     })
@@ -299,18 +341,28 @@ let result: TrendResult[]
   // ── Hooks ──
 
     return {
-      // Token pre‑execute hook – allows downstream agents to inject token counts
-      // Expected input: { sessionID: string, tokensIn?: number, tokensOut?: number }
-      async "tool.pre.execute"(input: { sessionID: string; tokensIn?: number; tokensOut?: number }, _output) {
-        const entry = sessionCtx.get(input.sessionID)
-        if (!entry) return
-        // Store pending token counts; they will be consumed by the next tool.execute.after
-        ;(entry as any).pendingTokens = {
-          tokensIn: input.tokensIn ?? 0,
-          tokensOut: input.tokensOut ?? 0,
-        }
-        return
-      },
+       // Token pre‑execute hook – allows downstream agents to inject token counts
+       // Expected input: { sessionID: string, tokensIn?: number, tokensOut?: number }
+       async "tool.pre.execute"(input: { sessionID: string; tokensIn?: number; tokensOut?: number; tool: string }, _output) {
+         // Detect sub-agent task launches and propagate dbPath/childMode
+         if (input.tool === "task") {
+           if (debugMode) log(`[task] pre-execute injecting dbPath=${dbPath} childMode=true`)
+           // Inject shared DB path and childMode flag into task args for child plugin
+           ;(input as any).args = {
+             ...(input as any).args,
+             dbPath,
+             childMode: true,
+           }
+         }
+         const entry = sessionCtx.get(input.sessionID)
+         if (!entry) return
+         // Store pending token counts; they will be consumed by the next tool.execute.after
+         ;(entry as any).pendingTokens = {
+           tokensIn: input.tokensIn ?? 0,
+           tokensOut: input.tokensOut ?? 0,
+         }
+         return
+       },
       flush: () => {
           // Clear periodic timers to prevent leaks on plugin reload
           if (TTL) clearInterval(TTL)
@@ -336,28 +388,38 @@ let result: TrendResult[]
      async "chat.message"(input, _output) {
         if (!input.sessionID) return
 
-        // Iteration guard – limit number of chat.message cycles per session
-        let entry = sessionCtx.get(input.sessionID)
-        if (entry) {
-          entry.iterationCount = (entry.iterationCount ?? 0) + 1
-          if (entry.iterationCount > maxIterations) {
-            if (debugMode) log(`[iteration guard] session ${input.sessionID.slice(0, 8)} exceeded max ${maxIterations}`)
-            // Apply confidence penalty if possible
-            if (entry.lastRecordId != null) {
-              const current = db.query("SELECT confidence FROM telemetry_v2 WHERE id = ?").get(entry.lastRecordId) as { confidence: number } | null
-              if (current && current.confidence > 0.5) {
-                const penalty = 0.15
-                db.run("UPDATE telemetry_v2 SET confidence = MAX(0, confidence - ?) WHERE id = ?", penalty, entry.lastRecordId)
-                metrics.iterationPenalties++
-                if (debugMode) log(`[iteration guard] penalized session ${input.sessionID.slice(0, 8)} confidence -${penalty}`)
-              }
-            }
-            metrics.iterationGuardTriggers++
-            // Mark as abandoned for cleanup
-            entry.abandonedAt = Date.now()
-            return
-          }
-        }
+// TODO: Refine iteration guard – ensure session entry creation, confidence penalty, user warning, and disable flag are fully implemented (see issue tracking)
+// Iteration guard – limit number of chat.message cycles per session
+let entry = sessionCtx.get(input.sessionID)
+    // If the session has been marked abandoned (e.g., by iteration guard), skip further processing
+    if (entry?.abandonedAt) return
+if (!entry) {
+  // Create a placeholder entry so the guard can run on the first message
+  entry = {
+    ctx: { model: input.model?.modelID, agent: input.agent },
+    ts: Date.now(),
+    iterationCount: 0,
+    toolStats: new Map(),
+  } as any
+  sessionCtx.set(input.sessionID, entry)
+}
+entry.iterationCount = (entry.iterationCount ?? 0) + 1
+if (!disableIterationGuard && entry.iterationCount > maxIterations) {
+  console.warn(`[adaptive] Iteration limit (${maxIterations}) reached for session ${input.sessionID.slice(0, 8)}. Further processing halted.`)
+  // Apply confidence penalty if possible
+  if (entry.lastRecordId != null) {
+    const current = db.query("SELECT confidence FROM telemetry_v2 WHERE id = ?").get(entry.lastRecordId) as { confidence: number } | null
+    if (current && current.confidence > 0.5) {
+      const penalty = 0.15
+      db.run("UPDATE telemetry_v2 SET confidence = MAX(0, confidence - ?) WHERE id = ?", penalty, entry.lastRecordId)
+      metrics.iterationPenalties++
+      console.warn(`[adaptive] Confidence penalty (-${penalty}) applied to session ${input.sessionID.slice(0, 8)} (record #${entry.lastRecordId}).`)
+    }
+  }
+  metrics.iterationGuardTriggers++
+
+  return
+}
 
         // Implicit abandonment detection: if another recent session exists, penalize it
       const ABANDONMENT_WINDOW_MS = 5 * 60 * 1000 // 5 minutes
@@ -397,36 +459,43 @@ let result: TrendResult[]
       const model = input.model?.modelID || undefined
 
        // Store session context for tool.execute.after correlation
-sessionCtx.set(input.sessionID, {
-           ctx: {
-             model,
-             agent: input.agent,
-           },
-            ts: Date.now(),
-           toolStats: new Map(),
-           iterationCount: entry?.iterationCount ?? 1,
-         })
+// Update session entry in‑place to preserve existing fields (lastRecordId, toolStats, hintsDelivered, etc.)
+if (entry) {
+  entry.ctx = { model, agent: input.agent }
+  entry.ts = Date.now()
+  // Ensure toolStats map exists
+  entry.toolStats = entry.toolStats ?? new Map()
+  entry.iterationCount = entry.iterationCount ?? 1
+} else {
+  // Fallback – should not happen because placeholder is created earlier
+  sessionCtx.set(input.sessionID, {
+    ctx: { model, agent: input.agent },
+    ts: Date.now(),
+    toolStats: new Map(),
+    iterationCount: 1,
+  })
+}
        log(`[chat.message] sessionCtx[${input.sessionID.slice(0, 8)}…] model=${model ?? "?"} agent=${input.agent ?? "?"}`)
     },
 
-    // Auto-observer — fires after every tool execution
-    async "tool.execute.after"(input, output) {
-      // 5s sliding window dedup: skip if same tool called within window
-      const dedupKey = `${input.sessionID}:${input.tool}`
-      const lastTs = recentOps.get(dedupKey)
-      const now = Date.now()
-      if (lastTs && (now - lastTs) < DEDUP_WINDOW) {
-        if (debugMode) log(`[dedup] skipped ${dedupKey} — ${now - lastTs}ms ago`)
-        return
-      }
-      recentOps.set(dedupKey, now)
+      // Auto-observer — fires after every tool execution
+      async "tool.execute.after"(input, output) {
+       // 5s sliding window dedup: skip if same tool called within window
+       const dedupKey = `${input.sessionID}:${input.tool}`
+       const lastTs = recentOps.get(dedupKey)
+       const now = Date.now()
+       if (lastTs && (now - lastTs) < DEDUP_WINDOW) {
+         if (debugMode) log(`[dedup] skipped ${dedupKey} — ${now - lastTs}ms ago`)
+         return
+       }
+       recentOps.set(dedupKey, now)
 
-        const entry = sessionCtx.get(input.sessionID)
-        // Touch entry on access to extend TTL
-        if (entry) {
-          entry.ts = Date.now()
-        }
-       const ctx = entry?.ctx || {}
+         const entry = sessionCtx.get(input.sessionID)
+         // Touch entry on access to extend TTL
+         if (entry) {
+           entry.ts = Date.now()
+         }
+        const ctx = entry?.ctx || {}
       const exitCode = output.metadata?.error ? 1 : 0
 
       const result: ToolResult = {

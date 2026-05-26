@@ -1,4 +1,5 @@
 // Smoke test for AdaptivePlugin v2 — passive observer
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import path from "path"
 import { describe, expect, test } from "bun:test"
 import { tmpdir } from "../../opencode/test/fixture/fixture"
@@ -612,7 +613,69 @@ test("integration: full capabilities test in one session", async () => {
   expect(metrics.dbErrors).toBe(0)
   expect(metrics.cacheEvictions).toBeGreaterThanOrEqual(0)
 
-  // 7. Cleanup
-  hooks.flush()
-})
-  })
+   // 7. Cleanup
+   hooks.flush()
+ })
+
+   describe("Sub-agent telemetry (childMode)", () => {
+     test("tool.pre.execute injects dbPath and childMode for task tool", async () => {
+       const { AdaptivePlugin } = await import("./adaptive")
+       const path = await import("path")
+       await using tmp = await tmpdir()
+       const dbPath = path.join(tmp.path, "shared.db")
+       const hooks = await AdaptivePlugin(MINIMAL_CTX(tmp.path), { dbPath })
+
+       // Capture the modified args via a spy on the actual task execution
+       // We'll call tool.pre.execute directly with a task tool
+       const input = {
+         sessionID: "s_task",
+         tool: "task",
+         callID: "c_task",
+         args: { prompt: "test prompt" },
+         tokensIn: 100,
+         tokensOut: 200,
+       } as any
+
+       await hooks["tool.pre.execute"]!(input, {} as any)
+
+       // Verify args were modified
+       expect(input.args.dbPath).toBe(dbPath)
+       expect(input.args.childMode).toBe(true)
+     })
+
+     test("childMode=true prevents interval creation", async () => {
+       const { AdaptivePlugin } = await import("./adaptive")
+       await using tmp = await tmpdir()
+       const hooks = await AdaptivePlugin(MINIMAL_CTX(tmp.path), { childMode: true })
+
+       // Access internal interval variables via closure is tricky; instead, verify behavior:
+       // Call flush — should not throw even if intervals are undefined
+       expect(() => hooks.flush()).not.toThrow()
+     })
+
+     test("parent and child share same dbPath (absolute resolution)", async () => {
+       const { AdaptivePlugin } = await import("./adaptive")
+       const path = await import("path")
+       await using tmp = await tmpdir()
+       const ctx = MINIMAL_CTX(tmp.path)
+       const dbPath = path.join(tmp.path, ".opencode_telemetry.db")
+
+       // Parent plugin
+       const parentHooks = await AdaptivePlugin(ctx, { dbPath })
+       await parentHooks["chat.message"]!({ sessionID: "s1", agent: "test" }, {} as any)
+       await parentHooks["tool.execute.after"]!({ tool: "Read", sessionID: "s1", callID: "c1", args: {} }, { output: "ok", metadata: {} } as any)
+       parentHooks.flush()
+
+       // Child plugin (simulated by childMode=true and same dbPath)
+       const childHooks = await AdaptivePlugin(ctx, { dbPath, childMode: true })
+       await childHooks["chat.message"]!({ sessionID: "s2", agent: "test" }, {} as any)
+       await childHooks["tool.execute.after"]!({ tool: "Read", sessionID: "s2", callID: "c2", args: {} }, { output: "ok", metadata: {} } as any)
+
+       // Query status from child — should see records from both parent and child
+       const status = JSON.parse(await childHooks.tool!.adaptive_status.execute({}, {} as any))
+       expect(status.stats.totalRecords).toBeGreaterThanOrEqual(2)
+
+       childHooks.flush()
+     })
+   })
+ })

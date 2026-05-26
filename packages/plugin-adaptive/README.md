@@ -20,23 +20,80 @@ The Adaptive Plugin is a **passive observer** for OpenCode that automatically ha
 4. **Deduplication** — Sliding window (5s) prevents duplicate recordings of rapid tool calls
 5. **Telemetry Export** — JSON/CSV export, status readout, and reset capability
 6. **Internal Metrics** — Counters for ops visibility (`adaptive_metrics` tool)
+7. **Sub-Agent Telemetry Capture** — When the orchestrator spawns sub‑agents via the `task` tool, the plugin automatically propagates the shared database path and enables `childMode` to ensure all child processes write to the same DB without timer collisions.
 
 ## Configuration Options
 
-- `dbPath` (string) – Path to the SQLite DB file (default: `.opencode_telemetry.db` in the working directory).
+- `adaptiveRetentionDays` (number) – Number of days to retain telemetry rows before automatic deletion (default 30).
+
+- `dbPath` (string) – Path to the SQLite DB file (default: `.opencode_telemetry.db` in the working directory). **Important:** For sub-agent telemetry capture, set this to an absolute path shared across parent and child processes (e.g., `"/path/to/shared/telemetry.db"`). The plugin resolves relative paths to absolute during initialization.
 - `debug` (boolean) – Enable verbose internal logging.
 - `experimentalActive` (boolean) – Enable experimental enrichment hooks.
 - `dedupWindow` (number) – Sliding‑window deduplication period in ms (default 5000).
 - `abandonmentTTL` (number) – Time‑to‑live for abandoned sessions before they are purged (default 30 minutes).
+- `maxIterations` (number) – Maximum number of `chat.message` cycles allowed per session before the iteration guard stops further processing. When exceeded, the guard:
+  * Increments `metrics.iterationGuardTriggers`.
+  * Applies a confidence penalty (`0.15`) to the last successful telemetry record (if its confidence > 0.5).
+  * Increments `metrics.iterationPenalties`.
+  * Emits a user‑visible warning (`console.warn`).
+  * Returns early from the `chat.message` hook, preventing further tool executions.
+- `disableIterationGuard` (boolean) – Disable the iteration guard entirely (default false).
+- `childMode` (boolean) – Internal flag indicating this plugin instance is running as a child process (set automatically when sub‑agents are spawned). When `true`, periodic cleanup timers are disabled to avoid collisions. **Do not set manually** — the plugin injects this into task arguments automatically.
+
+
 7. **Tool Enrichment** (experimental) — Appends reliability stats to tool descriptions (`tool.definition` hook)
 8. **Cross-Session Hints** (experimental) — Injects failing tool patterns from past sessions into new session prompts
 9. **Session Compaction Context** (experimental) — Preserves tool failure awareness across conversation compaction
+- Token counting always 0 – requires host instrumentation; documented limitation.
 
 **No state.json, no event system dependency, no chat.params modification** — purely passive data collection.
 
 **Scope:** This plugin provides telemetry, trend analysis, confidence scoring, and experimental enrichment hooks. Advisory routing & model recommendations are deferred to v2.2.
 
 ---
+
+## Usage Example
+```jsonc
+// Register plugin with retention policy of 7 days and guard disabled
+{
+  "plugin": [
+    ["./packages/plugin-adaptive", {
+      "debug": true,
+      "maxIterations": 5,
+      "disableIterationGuard": true,
+      "adaptiveRetentionDays": 7
+    }]
+  ]
+}
+```
+
+## Architecture
+
+### Sub-Agent Telemetry Capture
+
+When the orchestrator spawns sub‑agents using the `task` tool, the Adaptive Plugin ensures that child processes contribute to the same telemetry database:
+
+1. **Detection** — The `tool.pre.execute` hook intercepts calls to the `task` tool.
+2. **Propagation** — The hook injects two arguments into the task:
+   - `dbPath`: The absolute path to the shared SQLite database.
+   - `childMode: true`: Signals that the child is a telemetry participant (not the root plugin).
+3. **Child Initialization** — The child plugin instance reads these arguments from its config and:
+   - Uses the provided `dbPath` instead of the default.
+   - Skips creating periodic cleanup timers (TTL, retention, cache refresh, etc.) to avoid collisions with the parent.
+4. **Shared State** — Both parent and child write to the same `telemetry_v2` table, enabling unified trend analysis and status across all agents.
+
+**Configuration:** Set `dbPath` to an absolute path in the root plugin configuration to ensure all children resolve the same location.
+
+```jsonc
+{
+  "plugin": [
+    ["./packages/plugin-adaptive", {
+      "dbPath": "/absolute/path/to/telemetry.db",
+      "debug": true
+    }]
+  ]
+}
+```
 
 ## Architecture
 
