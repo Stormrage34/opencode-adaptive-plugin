@@ -10,7 +10,7 @@ import { writeRecord, type TelemetryRecord, type Database } from "./db.js"
 import { metrics } from "./metrics.js"
 
 // Signal weights (cumulative, base = 0.5)
-const SIGNALS: Record<string, number> = {
+const DEFAULT_SIGNALS: Record<string, number> = {
   tool_success: +0.35,         // Tool completed without error
   tool_failed: -0.40,          // Tool returned error/failure
   user_accept: +0.45,          // Explicit user acceptance signal
@@ -22,10 +22,20 @@ const SIGNALS: Record<string, number> = {
   timeout: -0.25,              // Execution took too long
 }
 
+// Configurable confidence weights (default to static SIGNALS)
+let confidenceWeights: Record<string, number> = { ...DEFAULT_SIGNALS }
+export function setConfidenceWeights(weights: Record<string, number>) {
+  confidenceWeights = { ...weights }
+}
+
+
+
 export interface ObserverContext {
   model?: string
   agent?: string
   promptHash?: string  // for deduplication
+  tokensIn?: number
+  tokensOut?: number
 }
 
 export interface ToolResult {
@@ -72,7 +82,8 @@ export function observe(
 ): number | bigint | null {
   if (!db) return null
 
-  const confidence = computeBaseConfidence(result.exitCode, result.durationMs)
+  // Base confidence from exit code & duration
+  const baseConfidence = computeBaseConfidence(result.exitCode, result.durationMs)
 
   const signals: Record<string, boolean | number> = {
     tool_success: result.exitCode === 0,
@@ -80,13 +91,21 @@ export function observe(
     timeout: !!(result.durationMs && result.durationMs > 30000),
   }
 
+  // Apply configurable confidence weights (linear additive)
+  let weightedAdjustment = 0
+  for (const [key, value] of Object.entries(signals)) {
+    const weight = confidenceWeights[key] ?? 0
+    weightedAdjustment += weight * (typeof value === 'boolean' ? (value ? 1 : 0) : Number(value))
+  }
+  const confidence = Math.min(1, Math.max(0, baseConfidence + weightedAdjustment))
+
   const rec: TelemetryRecord = {
     taskId: `task_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
     model: ctx.model,
     agent: ctx.agent,
     toolName: result.toolName,
-    tokensIn: 0,      // Not available in tool.execute.after
-    tokensOut: 0,     // Not available in tool.execute.after
+    tokensIn: ctx.tokensIn ?? 0,
+    tokensOut: ctx.tokensOut ?? 0,
     exitCode: result.exitCode,
     confidence,
     signalJson: JSON.stringify(signals),

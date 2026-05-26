@@ -1,4 +1,4 @@
-# Adaptive Plugin v2.1.2 — Architecture Reference
+# Adaptive Plugin v2.1.3 — Architecture Reference
 
 **Status:** Production-Ready  
 **Last Updated:** 2026-05-26  

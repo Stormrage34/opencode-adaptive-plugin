@@ -93,10 +93,12 @@ export const AdaptivePlugin: Plugin = async (ctx, options) => {
   }, 3600_000)
   if (DUP_WARN_CLEANUP.unref) DUP_WARN_CLEANUP.unref()
 
-  // 5s sliding window dedup — tracks (sessionID:toolName) timestamps using an efficient TTL cache
-  // Configurable via plugin options for testing
-  const DEDUP_WINDOW = config?.dedupWindow ?? 5000
-  const recentOps = new RecentOpsCache(DEDUP_WINDOW)
+    // 5s sliding window dedup — tracks (sessionID:toolName) timestamps using an efficient TTL cache
+    const DEDUP_WINDOW = config?.dedupWindow ?? 5000
+    const recentOps = new RecentOpsCache(DEDUP_WINDOW)
+    // Token injection hook support – store pending token counts per session
+    // Downstream agents can call "tool.pre.execute" to set tokens before the actual tool execution
+
 
   // Periodic cleanup for recentOps to prevent unbounded growth
   const RECENTOPS_CLEANUP_INTERVAL = 60 * 1000 // 60 seconds
@@ -284,7 +286,19 @@ let result: TrendResult[]
   // ── Hooks ──
 
     return {
-        flush: () => {
+      // Token pre‑execute hook – allows downstream agents to inject token counts
+      // Expected input: { sessionID: string, tokensIn?: number, tokensOut?: number }
+      async "tool.pre.execute"(input: { sessionID: string; tokensIn?: number; tokensOut?: number }, _output) {
+        const entry = sessionCtx.get(input.sessionID)
+        if (!entry) return
+        // Store pending token counts; they will be consumed by the next tool.execute.after
+        ;(entry as any).pendingTokens = {
+          tokensIn: input.tokensIn ?? 0,
+          tokensOut: input.tokensOut ?? 0,
+        }
+        return
+      },
+      flush: () => {
           // Clear periodic timers to prevent leaks on plugin reload
           if (TTL) clearInterval(TTL)
           if (DUP_WARN_CLEANUP) clearInterval(DUP_WARN_CLEANUP)
@@ -384,7 +398,10 @@ let result: TrendResult[]
       }
 
     if (debugMode) console.log('[observer] ctx', ctx)
-    const rowId = observe(db, ctx, result)
+    // Include any pending token counts from tool.pre.execute
+    const pending = (entry as any)?.pendingTokens || { tokensIn: 0, tokensOut: 0 }
+    const ctxWithTokens = { ...ctx, tokensIn: pending.tokensIn, tokensOut: pending.tokensOut }
+    const rowId = observe(db, ctxWithTokens, result)
    if (debugMode) console.log(`[observer] rowId=${rowId}`)
 
    // Mark tool as dirty in cache so it gets refreshed on next interval
