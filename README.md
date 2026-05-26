@@ -1,5 +1,62 @@
 # Adaptive Plugin — Summary
 
+## Architecture Overview
+
+The plugin’s high‑level architecture is documented in **[architecture-tree.md](architecture-tree.md)**. Below is the core diagram extracted for quick reference:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         OpenCode Core (Host)                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Hooks Registered by AdaptivePlugin:                                   │
+│    • tool.execute.after  ←─ captures every tool execution             │
+│    • chat.message        ←─ session context & abandonment detection   │
+│    • flush               ←─ cleanup on shutdown                       │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       AdaptivePlugin (Entry)                           │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ State (per plugin instance):                                     │  │
+│  │   • db: Database (SQLite WAL)                                    │  │
+│  │   • sessionCtx: Map<sessionID, {ctx, ts, lastRecordId, toolStats}>│ │
+│  │   • recentOps: RecentOpsCache (5s sliding window)               │  │
+│  │   • duplicateWarningTimestamps: Map<key, ts> (rate‑limit)       │  │
+│  │   • timers: TTL cleanup, dup cleanup, recentOps cleanup        │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                     ┌──────────────┴──────────────┐
+                     ▼                             ▼
+         ┌─────────────────────┐   ┌─────────────────────────┐
+         │   chat.message      │   │  tool.execute.after    │
+         │   (Session Context) │   │  (Auto‑Observer)       │
+         └─────────────────────┘   └─────────────────────────┘
+                     │                             │
+                     │ stores/updates              │ computes confidence
+                     ▼                             ▼
+         ┌─────────────────────┐   ┌─────────────────────────┐
+         │  sessionCtx Map      │   │   observe()             │
+         │  + abandonment      │   │   • computeBaseConf()   │
+         │    penalty update   │   │   • writeRecord()       │
+         └─────────────────────┘   │   • queueMicrotask()    │
+                                    │     (validation update) │
+                                    └─────────────────────────┘
+                                             │
+                                             ▼
+                                    ┌─────────────────────┐
+                                    │   writeRecord()     │
+                                    │   (db.ts)           │
+                                    └─────────────────────┘
+                                             │
+                                             ▼
+                                    ┌─────────────────────┐
+                                    │   SQLite            │
+                                    │   telemetry_v2      │
+                                    └─────────────────────┘
+```
+
 ## What It Does
 
 The Adaptive Plugin is a **passive observer** for OpenCode that automatically harvests implicit signals from tool executions and stores them in a local SQLite database. It provides:
