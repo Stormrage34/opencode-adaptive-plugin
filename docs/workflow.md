@@ -1,0 +1,1 @@
+Legacy workflow documentation removed – no longer applicable.
